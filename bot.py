@@ -1,4 +1,5 @@
 import warnings
+# Suppress requests dependency warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 
 import requests, time, re, random, os, json, logging, threading, pyotp, string, sqlite3
@@ -9,7 +10,16 @@ from dotenv import load_dotenv
 from faker import Faker
 from concurrent.futures import ThreadPoolExecutor
 
-# Suppress logs
+# === NEW: PostgreSQL support ===
+try:
+    import psycopg2
+    from psycopg2 import pool
+    USE_POSTGRES = True
+except ImportError:
+    USE_POSTGRES = False
+    print("[WARN] psycopg2 not installed. Falling back to SQLite.")
+
+# Suppress all terminal output (except critical errors)
 logging.getLogger().setLevel(logging.CRITICAL)
 for logger_name in ['urllib3', 'requests', 'faker', 'pyotp']:
     logging.getLogger(logger_name).setLevel(logging.CRITICAL)
@@ -22,6 +32,7 @@ GROUP_ID = os.getenv('GROUP_ID')
 SUPPORT_USERNAME = os.getenv('SUPPORT_USERNAME', '@shihab98bc')
 TIMEOUT_SECONDS = int(os.getenv('TIMEOUT_SECONDS', 600))
 
+# Default provider credentials (fallback)
 DEFAULT_STEX_EMAIL = os.getenv('STEX_EMAIL')
 DEFAULT_STEX_PASSWORD = os.getenv('STEX_PASSWORD')
 DEFAULT_MNIT_EMAIL = os.getenv('MNIT_EMAIL')
@@ -36,50 +47,67 @@ if not DEFAULT_MNIT_EMAIL or not DEFAULT_MNIT_PASSWORD:
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
+# Fetch bot username for deep links
 try:
     bot_info = requests.get(f"{TG_API}/getMe").json()
     BOT_USERNAME = bot_info['result']['username']
 except Exception:
     BOT_USERNAME = None
 
-# ---------- Database Setup with Railway /data volume support ----------
-# Use /data/ for Railway persistent storage, fallback to local file
-DB_FILE = os.environ.get('DB_PATH', 'user_creds.db')
-
-# Ensure the parent directory exists
-db_dir = os.path.dirname(DB_FILE)
-if db_dir and not os.path.exists(db_dir):
-    try:
-        os.makedirs(db_dir, exist_ok=True)
-        print(f"[INFO] Created database directory: {db_dir}")
-    except Exception as e:
-        print(f"[WARN] Could not create {db_dir}: {e}. Falling back to local file.")
-        DB_FILE = 'user_creds.db'  # fallback to current directory
-
+# ---------- Database Setup ----------
 db_lock = threading.Lock()
 
-def init_db():
-    with db_lock:
+# === PostgreSQL Connection Pool (Railway friendly) ===
+if USE_POSTGRES:
+    DATABASE_URL = os.getenv('DATABASE_URL')
+    if DATABASE_URL:
         try:
-            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-            c = conn.cursor()
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS user_credentials (
-                    user_id INTEGER,
-                    provider TEXT,
-                    email TEXT,
-                    password TEXT,
-                    PRIMARY KEY (user_id, provider)
-                )
-            ''')
-            conn.commit()
-            conn.close()
-            print(f"[INFO] Database initialized at {DB_FILE}")
-        except sqlite3.OperationalError as e:
-            print(f"[FATAL] Could not open database {DB_FILE}: {e}")
-            # Try a final fallback to local file
-            global DB_FILE
+            pg_pool = pool.SimpleConnectionPool(1, 10, DATABASE_URL)
+            print("[INFO] PostgreSQL connection pool created.")
+        except Exception as e:
+            print(f"[FATAL] Could not create PostgreSQL pool: {e}")
+            USE_POSTGRES = False
+    else:
+        print("[WARN] DATABASE_URL not found. Falling back to SQLite.")
+        USE_POSTGRES = False
+
+# Fallback to SQLite
+if not USE_POSTGRES:
+    DB_FILE = os.environ.get('DB_PATH', 'user_creds.db')
+    # Ensure directory exists (for Railway volume)
+    db_dir = os.path.dirname(DB_FILE)
+    if db_dir and not os.path.exists(db_dir):
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+            print(f"[INFO] Created database directory: {db_dir}")
+        except Exception as e:
+            print(f"[WARN] Could not create {db_dir}: {e}. Using local file.")
             DB_FILE = 'user_creds.db'
+    print(f"[INFO] Using SQLite database at: {DB_FILE}")
+
+def init_db():
+    if USE_POSTGRES:
+        with db_lock:
+            conn = pg_pool.getconn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute('''
+                        CREATE TABLE IF NOT EXISTS user_credentials (
+                            user_id BIGINT,
+                            provider TEXT,
+                            email TEXT,
+                            password TEXT,
+                            PRIMARY KEY (user_id, provider)
+                        )
+                    ''')
+                conn.commit()
+                print("[INFO] PostgreSQL database initialized.")
+            except Exception as e:
+                print(f"[FATAL] Could not initialize PostgreSQL: {e}")
+            finally:
+                pg_pool.putconn(conn)
+    else:
+        with db_lock:
             conn = sqlite3.connect(DB_FILE, check_same_thread=False)
             c = conn.cursor()
             c.execute('''
@@ -93,43 +121,92 @@ def init_db():
             ''')
             conn.commit()
             conn.close()
-            print(f"[INFO] Fallback database initialized at {DB_FILE}")
+            print("[INFO] SQLite database initialized.")
 
 init_db()
 
 def save_credentials(user_id, provider, email, password):
-    with db_lock:
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        c = conn.cursor()
-        c.execute('''
-            INSERT OR REPLACE INTO user_credentials (user_id, provider, email, password)
-            VALUES (?, ?, ?, ?)
-        ''', (user_id, provider, email, password))
-        conn.commit()
-        conn.close()
+    if USE_POSTGRES:
+        with db_lock:
+            conn = pg_pool.getconn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute('''
+                        INSERT INTO user_credentials (user_id, provider, email, password)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (user_id, provider) DO UPDATE SET
+                        email = EXCLUDED.email,
+                        password = EXCLUDED.password
+                    ''', (user_id, provider, email, password))
+                conn.commit()
+            except Exception as e:
+                print(f"[ERROR] Failed to save credentials: {e}")
+            finally:
+                pg_pool.putconn(conn)
+    else:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            c = conn.cursor()
+            c.execute('''
+                INSERT OR REPLACE INTO user_credentials (user_id, provider, email, password)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, provider, email, password))
+            conn.commit()
+            conn.close()
 
 def get_credentials(user_id, provider):
-    with db_lock:
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        c = conn.cursor()
-        c.execute('SELECT email, password FROM user_credentials WHERE user_id=? AND provider=?',
-                  (user_id, provider))
-        row = c.fetchone()
-        conn.close()
-        return (row[0], row[1]) if row else (None, None)
+    if USE_POSTGRES:
+        with db_lock:
+            conn = pg_pool.getconn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute('SELECT email, password FROM user_credentials WHERE user_id=%s AND provider=%s',
+                                (user_id, provider))
+                    row = cur.fetchone()
+                    return (row[0], row[1]) if row else (None, None)
+            except Exception as e:
+                print(f"[ERROR] Failed to get credentials: {e}")
+                return (None, None)
+            finally:
+                pg_pool.putconn(conn)
+    else:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            c = conn.cursor()
+            c.execute('SELECT email, password FROM user_credentials WHERE user_id=? AND provider=?',
+                      (user_id, provider))
+            row = c.fetchone()
+            conn.close()
+            return (row[0], row[1]) if row else (None, None)
 
 def delete_credentials(user_id, provider=None):
-    with db_lock:
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        c = conn.cursor()
-        if provider:
-            c.execute('DELETE FROM user_credentials WHERE user_id=? AND provider=?', (user_id, provider))
-        else:
-            c.execute('DELETE FROM user_credentials WHERE user_id=?', (user_id,))
-        conn.commit()
-        conn.close()
+    if USE_POSTGRES:
+        with db_lock:
+            conn = pg_pool.getconn()
+            try:
+                with conn.cursor() as cur:
+                    if provider:
+                        cur.execute('DELETE FROM user_credentials WHERE user_id=%s AND provider=%s', (user_id, provider))
+                    else:
+                        cur.execute('DELETE FROM user_credentials WHERE user_id=%s', (user_id,))
+                conn.commit()
+            except Exception as e:
+                print(f"[ERROR] Failed to delete credentials: {e}")
+            finally:
+                pg_pool.putconn(conn)
+    else:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            c = conn.cursor()
+            if provider:
+                c.execute('DELETE FROM user_credentials WHERE user_id=? AND provider=?', (user_id, provider))
+            else:
+                c.execute('DELETE FROM user_credentials WHERE user_id=?', (user_id,))
+            conn.commit()
+            conn.close()
 
 # ---------- Thread-safe structures ----------
+# Bot instances cache: key = (provider, user_id) or (provider, 'default')
 bot_instances = {}
 instances_lock = threading.RLock()
 user_states = {}
@@ -142,6 +219,7 @@ RATE_LIMIT_SECONDS = 15
 executor = ThreadPoolExecutor(max_workers=10)
 fake = Faker('en_US')
 
+# Pre-compile OTP pattern
 OTP_PATTERN = re.compile(
     r'(?:<#>)\s*(\d{4,8})|'
     r'(?:code|otp|pin|verification)[:\s]+(\d{4,8})|'
