@@ -1,5 +1,4 @@
 import warnings
-# Suppress requests dependency warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 
 import requests, time, re, random, os, json, logging, threading, pyotp, string, sqlite3
@@ -10,7 +9,7 @@ from dotenv import load_dotenv
 from faker import Faker
 from concurrent.futures import ThreadPoolExecutor
 
-# Suppress all terminal output (except critical errors)
+# Suppress logs
 logging.getLogger().setLevel(logging.CRITICAL)
 for logger_name in ['urllib3', 'requests', 'faker', 'pyotp']:
     logging.getLogger(logger_name).setLevel(logging.CRITICAL)
@@ -23,7 +22,6 @@ GROUP_ID = os.getenv('GROUP_ID')
 SUPPORT_USERNAME = os.getenv('SUPPORT_USERNAME', '@shihab98bc')
 TIMEOUT_SECONDS = int(os.getenv('TIMEOUT_SECONDS', 600))
 
-# Default provider credentials (fallback)
 DEFAULT_STEX_EMAIL = os.getenv('STEX_EMAIL')
 DEFAULT_STEX_PASSWORD = os.getenv('STEX_PASSWORD')
 DEFAULT_MNIT_EMAIL = os.getenv('MNIT_EMAIL')
@@ -38,33 +36,64 @@ if not DEFAULT_MNIT_EMAIL or not DEFAULT_MNIT_PASSWORD:
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# Fetch bot username for deep links
 try:
     bot_info = requests.get(f"{TG_API}/getMe").json()
     BOT_USERNAME = bot_info['result']['username']
 except Exception:
     BOT_USERNAME = None
 
-# ---------- Database Setup (Railway persistent volume) ----------
+# ---------- Database Setup with Railway /data volume support ----------
 # Use /data/ for Railway persistent storage, fallback to local file
-DB_FILE = os.environ.get('DB_PATH', '/data/user_creds.db')
+DB_FILE = os.environ.get('DB_PATH', 'user_creds.db')
+
+# Ensure the parent directory exists
+db_dir = os.path.dirname(DB_FILE)
+if db_dir and not os.path.exists(db_dir):
+    try:
+        os.makedirs(db_dir, exist_ok=True)
+        print(f"[INFO] Created database directory: {db_dir}")
+    except Exception as e:
+        print(f"[WARN] Could not create {db_dir}: {e}. Falling back to local file.")
+        DB_FILE = 'user_creds.db'  # fallback to current directory
+
 db_lock = threading.Lock()
 
 def init_db():
     with db_lock:
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        c = conn.cursor()
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS user_credentials (
-                user_id INTEGER,
-                provider TEXT,
-                email TEXT,
-                password TEXT,
-                PRIMARY KEY (user_id, provider)
-            )
-        ''')
-        conn.commit()
-        conn.close()
+        try:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            c = conn.cursor()
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS user_credentials (
+                    user_id INTEGER,
+                    provider TEXT,
+                    email TEXT,
+                    password TEXT,
+                    PRIMARY KEY (user_id, provider)
+                )
+            ''')
+            conn.commit()
+            conn.close()
+            print(f"[INFO] Database initialized at {DB_FILE}")
+        except sqlite3.OperationalError as e:
+            print(f"[FATAL] Could not open database {DB_FILE}: {e}")
+            # Try a final fallback to local file
+            global DB_FILE
+            DB_FILE = 'user_creds.db'
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            c = conn.cursor()
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS user_credentials (
+                    user_id INTEGER,
+                    provider TEXT,
+                    email TEXT,
+                    password TEXT,
+                    PRIMARY KEY (user_id, provider)
+                )
+            ''')
+            conn.commit()
+            conn.close()
+            print(f"[INFO] Fallback database initialized at {DB_FILE}")
 
 init_db()
 
@@ -101,7 +130,6 @@ def delete_credentials(user_id, provider=None):
         conn.close()
 
 # ---------- Thread-safe structures ----------
-# Bot instances cache: key = (provider, user_id) or (provider, 'default')
 bot_instances = {}
 instances_lock = threading.RLock()
 user_states = {}
@@ -114,7 +142,6 @@ RATE_LIMIT_SECONDS = 15
 executor = ThreadPoolExecutor(max_workers=10)
 fake = Faker('en_US')
 
-# Pre-compile OTP pattern
 OTP_PATTERN = re.compile(
     r'(?:<#>)\s*(\d{4,8})|'
     r'(?:code|otp|pin|verification)[:\s]+(\d{4,8})|'
@@ -151,7 +178,7 @@ def generate_identity(gender):
     password = generate_strong_password()
     return emoji, full_name, username, password
 
-# ---------- StexSMS Class (unchanged logic) ----------
+# ---------- StexSMS Class (unchanged) ----------
 class StexSMS:
     def __init__(self, provider, email, password):
         self.provider = provider
@@ -314,11 +341,6 @@ class StexSMS:
 
 # ---------- Bot Instance Management ----------
 def get_bot_instance(provider, user_id=None):
-    """
-    Returns a StexSMS instance for the given provider.
-    If user_id is provided and credentials exist in DB, use them;
-    otherwise fall back to default environment credentials.
-    """
     cache_key = (provider, user_id) if user_id else (provider, 'default')
     with instances_lock:
         if cache_key in bot_instances:
@@ -327,7 +349,6 @@ def get_bot_instance(provider, user_id=None):
         if user_id:
             email, password = get_credentials(user_id, provider)
             if not email or not password:
-                # Fallback to default
                 if provider == 'stexsms':
                     email, password = DEFAULT_STEX_EMAIL, DEFAULT_STEX_PASSWORD
                 else:
@@ -344,7 +365,6 @@ def get_bot_instance(provider, user_id=None):
         return bot
 
 def logout_user(user_id, provider=None):
-    """Remove stored credentials and clear cached instances for the user."""
     delete_credentials(user_id, provider)
     with instances_lock:
         keys_to_del = [k for k in bot_instances if k[0] == provider and k[1] == user_id] if provider else \
@@ -366,8 +386,6 @@ def validate_range(range_str):
 
 # ---------- Keyboards ----------
 def main_keyboard(user_id):
-    """Dynamic main menu: shows Logout if user has any stored credentials, else Log IN."""
-    # Check if user has any saved credentials
     has_creds = False
     for prov in ['stexsms', 'mnitnetwork']:
         email, _ = get_credentials(user_id, prov)
@@ -603,18 +621,15 @@ def process_login_password(chat_id, text, state):
     provider = state['provider']
     email = state['email']
 
-    # Verify credentials by attempting a login
     try:
         test_bot = StexSMS(provider=provider, email=email, password=password)
-        test_bot.login()  # raises on failure
+        test_bot.login()
     except Exception as e:
         tg_send(chat_id, f"❌ <b>Login failed:</b> {escape(str(e))}\n\nPlease check your credentials and try again.",
                 cancel_keyboard())
         return
 
-    # Save to database
     save_credentials(chat_id, provider, email, password)
-    # Clear any cached default instance for this user+provider
     with instances_lock:
         cache_key = (provider, chat_id)
         if cache_key in bot_instances:
@@ -629,7 +644,6 @@ def process_login_password(chat_id, text, state):
             main_keyboard(chat_id))
 
 def handle_logout(chat_id):
-    # Logout from all providers
     logout_user(chat_id)
     tg_send(chat_id, "🔓 <b>You have been logged out.</b> Using default accounts again.", main_keyboard(chat_id))
 
@@ -651,7 +665,6 @@ def run_telegram_bot():
                     with states_lock:
                         state = user_states.get(chat_id)
 
-                    # ---------- State Handling ----------
                     if state:
                         step = state.get('step')
                         if step == 'awaiting_login_provider':
@@ -725,7 +738,6 @@ def run_telegram_bot():
                                 tg_send(chat_id, msg, main_keyboard(chat_id))
                                 continue
 
-                    # ---------- Commands & Main Menu ----------
                     if text.startswith('/start'):
                         parts = text.split()
                         payload = parts[1] if len(parts) > 1 else None
@@ -782,7 +794,6 @@ def run_telegram_bot():
 <i>Example: JBSW Y3DP FH5Q VKBF H3TE 2SYW</i>"""
                         tg_send(chat_id, instruction, {'keyboard': [[{'text': '⬅️ Back'}]], 'resize_keyboard': True})
                     elif text in ['🔐 Log IN', '🔓 Logout']:
-                        # Check if it's Logout
                         has_creds = False
                         for prov in ['stexsms', 'mnitnetwork']:
                             email, _ = get_credentials(chat_id, prov)
@@ -802,7 +813,6 @@ For any assistance, please contact:
 <i>We're here to help you 24/7!</i>"""
                         tg_send(chat_id, support_msg, main_keyboard(chat_id))
 
-                # Callback queries (unused but kept for completeness)
                 elif 'callback_query' in update:
                     cq = update['callback_query']
                     cq_chat = cq['message']['chat']['id']
