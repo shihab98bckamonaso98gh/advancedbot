@@ -1,25 +1,15 @@
 import warnings
-# Suppress requests dependency warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 
 import requests, time, re, random, os, json, logging, threading, pyotp, string, sqlite3
 from datetime import datetime, timedelta
-from html import escape
+from html import escape, unescape
 from collections import defaultdict
 from dotenv import load_dotenv
 from faker import Faker
 from concurrent.futures import ThreadPoolExecutor
 
-# === NEW: PostgreSQL support ===
-try:
-    import psycopg2
-    from psycopg2 import pool
-    USE_POSTGRES = True
-except ImportError:
-    USE_POSTGRES = False
-    print("[WARN] psycopg2 not installed. Falling back to SQLite.")
-
-# Suppress all terminal output (except critical errors)
+# Suppress logs
 logging.getLogger().setLevel(logging.CRITICAL)
 for logger_name in ['urllib3', 'requests', 'faker', 'pyotp']:
     logging.getLogger(logger_name).setLevel(logging.CRITICAL)
@@ -29,10 +19,8 @@ load_dotenv()
 # ---------- Environment Validation ----------
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_ID = os.getenv('GROUP_ID')
-SUPPORT_USERNAME = os.getenv('SUPPORT_USERNAME', '@shihab98bc')
 TIMEOUT_SECONDS = int(os.getenv('TIMEOUT_SECONDS', 600))
 
-# Default provider credentials (fallback)
 DEFAULT_STEX_EMAIL = os.getenv('STEX_EMAIL')
 DEFAULT_STEX_PASSWORD = os.getenv('STEX_PASSWORD')
 DEFAULT_MNIT_EMAIL = os.getenv('MNIT_EMAIL')
@@ -47,7 +35,6 @@ if not DEFAULT_MNIT_EMAIL or not DEFAULT_MNIT_PASSWORD:
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# Fetch bot username for deep links
 try:
     bot_info = requests.get(f"{TG_API}/getMe").json()
     BOT_USERNAME = bot_info['result']['username']
@@ -55,59 +42,22 @@ except Exception:
     BOT_USERNAME = None
 
 # ---------- Database Setup ----------
+DB_FILE = os.environ.get('DB_PATH', 'user_creds.db')
+db_dir = os.path.dirname(DB_FILE)
+if db_dir and not os.path.exists(db_dir):
+    try:
+        os.makedirs(db_dir, exist_ok=True)
+        print(f"[INFO] Created database directory: {db_dir}")
+    except Exception as e:
+        print(f"[WARN] Could not create {db_dir}: {e}. Falling back to local file.")
+        DB_FILE = 'user_creds.db'
+
 db_lock = threading.Lock()
 
-# === PostgreSQL Connection Pool (Railway friendly) ===
-if USE_POSTGRES:
-    DATABASE_URL = os.getenv('DATABASE_URL')
-    if DATABASE_URL:
-        try:
-            pg_pool = pool.SimpleConnectionPool(1, 10, DATABASE_URL)
-            print("[INFO] PostgreSQL connection pool created.")
-        except Exception as e:
-            print(f"[FATAL] Could not create PostgreSQL pool: {e}")
-            USE_POSTGRES = False
-    else:
-        print("[WARN] DATABASE_URL not found. Falling back to SQLite.")
-        USE_POSTGRES = False
-
-# Fallback to SQLite
-if not USE_POSTGRES:
-    DB_FILE = os.environ.get('DB_PATH', 'user_creds.db')
-    # Ensure directory exists (for Railway volume)
-    db_dir = os.path.dirname(DB_FILE)
-    if db_dir and not os.path.exists(db_dir):
-        try:
-            os.makedirs(db_dir, exist_ok=True)
-            print(f"[INFO] Created database directory: {db_dir}")
-        except Exception as e:
-            print(f"[WARN] Could not create {db_dir}: {e}. Using local file.")
-            DB_FILE = 'user_creds.db'
-    print(f"[INFO] Using SQLite database at: {DB_FILE}")
-
 def init_db():
-    if USE_POSTGRES:
-        with db_lock:
-            conn = pg_pool.getconn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute('''
-                        CREATE TABLE IF NOT EXISTS user_credentials (
-                            user_id BIGINT,
-                            provider TEXT,
-                            email TEXT,
-                            password TEXT,
-                            PRIMARY KEY (user_id, provider)
-                        )
-                    ''')
-                conn.commit()
-                print("[INFO] PostgreSQL database initialized.")
-            except Exception as e:
-                print(f"[FATAL] Could not initialize PostgreSQL: {e}")
-            finally:
-                pg_pool.putconn(conn)
-    else:
-        with db_lock:
+    global DB_FILE  # Fix: declare global at function start
+    with db_lock:
+        try:
             conn = sqlite3.connect(DB_FILE, check_same_thread=False)
             c = conn.cursor()
             c.execute('''
@@ -121,92 +71,61 @@ def init_db():
             ''')
             conn.commit()
             conn.close()
-            print("[INFO] SQLite database initialized.")
+            print(f"[INFO] Database initialized at {DB_FILE}")
+        except sqlite3.OperationalError as e:
+            print(f"[FATAL] Could not open database {DB_FILE}: {e}")
+            # Fallback to local file
+            DB_FILE = 'user_creds.db'
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            c = conn.cursor()
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS user_credentials (
+                    user_id INTEGER,
+                    provider TEXT,
+                    email TEXT,
+                    password TEXT,
+                    PRIMARY KEY (user_id, provider)
+                )
+            ''')
+            conn.commit()
+            conn.close()
+            print(f"[INFO] Fallback database initialized at {DB_FILE}")
 
 init_db()
 
 def save_credentials(user_id, provider, email, password):
-    if USE_POSTGRES:
-        with db_lock:
-            conn = pg_pool.getconn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute('''
-                        INSERT INTO user_credentials (user_id, provider, email, password)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (user_id, provider) DO UPDATE SET
-                        email = EXCLUDED.email,
-                        password = EXCLUDED.password
-                    ''', (user_id, provider, email, password))
-                conn.commit()
-            except Exception as e:
-                print(f"[ERROR] Failed to save credentials: {e}")
-            finally:
-                pg_pool.putconn(conn)
-    else:
-        with db_lock:
-            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-            c = conn.cursor()
-            c.execute('''
-                INSERT OR REPLACE INTO user_credentials (user_id, provider, email, password)
-                VALUES (?, ?, ?, ?)
-            ''', (user_id, provider, email, password))
-            conn.commit()
-            conn.close()
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        c = conn.cursor()
+        c.execute('''
+            INSERT OR REPLACE INTO user_credentials (user_id, provider, email, password)
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, provider, email, password))
+        conn.commit()
+        conn.close()
 
 def get_credentials(user_id, provider):
-    if USE_POSTGRES:
-        with db_lock:
-            conn = pg_pool.getconn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute('SELECT email, password FROM user_credentials WHERE user_id=%s AND provider=%s',
-                                (user_id, provider))
-                    row = cur.fetchone()
-                    return (row[0], row[1]) if row else (None, None)
-            except Exception as e:
-                print(f"[ERROR] Failed to get credentials: {e}")
-                return (None, None)
-            finally:
-                pg_pool.putconn(conn)
-    else:
-        with db_lock:
-            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-            c = conn.cursor()
-            c.execute('SELECT email, password FROM user_credentials WHERE user_id=? AND provider=?',
-                      (user_id, provider))
-            row = c.fetchone()
-            conn.close()
-            return (row[0], row[1]) if row else (None, None)
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        c = conn.cursor()
+        c.execute('SELECT email, password FROM user_credentials WHERE user_id=? AND provider=?',
+                  (user_id, provider))
+        row = c.fetchone()
+        conn.close()
+        return (row[0], row[1]) if row else (None, None)
 
 def delete_credentials(user_id, provider=None):
-    if USE_POSTGRES:
-        with db_lock:
-            conn = pg_pool.getconn()
-            try:
-                with conn.cursor() as cur:
-                    if provider:
-                        cur.execute('DELETE FROM user_credentials WHERE user_id=%s AND provider=%s', (user_id, provider))
-                    else:
-                        cur.execute('DELETE FROM user_credentials WHERE user_id=%s', (user_id,))
-                conn.commit()
-            except Exception as e:
-                print(f"[ERROR] Failed to delete credentials: {e}")
-            finally:
-                pg_pool.putconn(conn)
-    else:
-        with db_lock:
-            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-            c = conn.cursor()
-            if provider:
-                c.execute('DELETE FROM user_credentials WHERE user_id=? AND provider=?', (user_id, provider))
-            else:
-                c.execute('DELETE FROM user_credentials WHERE user_id=?', (user_id,))
-            conn.commit()
-            conn.close()
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        c = conn.cursor()
+        if provider:
+            c.execute('DELETE FROM user_credentials WHERE user_id=? AND provider=?', (user_id, provider))
+        else:
+            c.execute('DELETE FROM user_credentials WHERE user_id=?', (user_id,))
+        conn.commit()
+        conn.close()
 
 # ---------- Thread-safe structures ----------
-# Bot instances cache: key = (provider, user_id) or (provider, 'default')
 bot_instances = {}
 instances_lock = threading.RLock()
 user_states = {}
@@ -219,7 +138,6 @@ RATE_LIMIT_SECONDS = 15
 executor = ThreadPoolExecutor(max_workers=10)
 fake = Faker('en_US')
 
-# Pre-compile OTP pattern
 OTP_PATTERN = re.compile(
     r'(?:<#>)\s*(\d{4,8})|'
     r'(?:code|otp|pin|verification)[:\s]+(\d{4,8})|'
@@ -228,6 +146,18 @@ OTP_PATTERN = re.compile(
     r'\b(\d{4,6})\b',
     re.IGNORECASE
 )
+
+# ---------- TempMail Settings ----------
+AVAILABLE_DOMAINS = [
+    "mailto.plus","fexpost.com","fexbox.org","mailbox.in.ua",
+    "rover.info","chitthi.in","fextemp.com","any.pink","merepost.com"
+]
+MAX_EMAILS = 5
+INACTIVE_TIMEOUT = 30 * 60  # seconds
+FETCH_INTERVAL = 2  # seconds
+
+user_temp_emails = {}        # user_id -> {"emails": [...], "last_active": timestamp}
+temp_email_lock = threading.RLock()
 
 # ---------- Helper Functions ----------
 def clean_number(number):
@@ -255,6 +185,59 @@ def generate_identity(gender):
     username = f"{first_name.lower()}{last_name.lower()}{random.randint(10,99)}"
     password = generate_strong_password()
     return emoji, full_name, username, password
+
+# ---------- TempMail Helpers ----------
+def generate_temp_email(domain):
+    local = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=10))
+    return f"{local}@{domain}"
+
+def clean_html(raw_html):
+    raw_html = re.sub(r"<(script|style).*?>.*?</\\1>", "", raw_html, flags=re.S)
+    raw_html = re.sub(r"<br\\s*/?>|</p>", "\n", raw_html)
+    raw_html = re.sub(r"<[^>]+>", "", raw_html)
+    raw_html = unescape(raw_html)
+    return re.sub(r"\n{2,}", "\n", raw_html).strip()
+
+def extract_otp_temp(text):
+    m = re.search(r"\b\d{4,8}\b", text)
+    return m.group() if m else None
+
+def fetch_latest_mail(email):
+    encoded = email.replace("@", "%40")
+    url = f"https://tempmail.plus/api/mails?email={encoded}&first_id=0&epin="
+    headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Cookie": f"email={encoded}",
+        "Referer": "https://tempmail.plus/en/"
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            return None
+        mails = r.json().get("mail_list", [])
+        return mails[0] if mails else None
+    except Exception:
+        return None
+
+def fetch_mail_content(email, mail_id):
+    url = f"https://tempmail.plus/api/mails/{mail_id}"
+    headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Cookie": f"email={email.replace('@','%40')}",
+        "Referer": "https://tempmail.plus/en/"
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            return ""
+        data = r.json()
+        if data.get("text"):
+            return data["text"].strip()
+        if data.get("html"):
+            return clean_html(data["html"])
+        return ""
+    except Exception:
+        return ""
 
 # ---------- StexSMS Class (unchanged) ----------
 class StexSMS:
@@ -476,7 +459,7 @@ def main_keyboard(user_id):
         'keyboard': [
             [{'text': '📞 Get Number'}, {'text': '🔄 Change Number'}],
             [{'text': '👤 Fake Name'}, {'text': '🔐 Get 2FA'}],
-            [{'text': login_text}, {'text': '🆘 Support'}]
+            [{'text': login_text}, {'text': '📧 Temp Mail'}]
         ],
         'resize_keyboard': True
     }
@@ -515,6 +498,18 @@ def login_provider_keyboard():
 
 def cancel_keyboard():
     return {'keyboard': [[{'text': '⬅️ Cancel'}]], 'resize_keyboard': True}
+
+def temp_domain_keyboard():
+    rows, row = [], []
+    for d in AVAILABLE_DOMAINS:
+        row.append({'text': d})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{'text': '⬅️ Cancel'}])
+    return {'keyboard': rows, 'resize_keyboard': True}
 
 # ---------- Message Formatters ----------
 def format_inbox_message(number, provider, full_message, otp):
@@ -725,6 +720,78 @@ def handle_logout(chat_id):
     logout_user(chat_id)
     tg_send(chat_id, "🔓 <b>You have been logged out.</b> Using default accounts again.", main_keyboard(chat_id))
 
+# ---------- TempMail Inbox Watcher (Background Thread) ----------
+def temp_inbox_watcher():
+    while True:
+        with temp_email_lock:
+            snapshot = [(uid, list(info.get("emails", []))) for uid, info in user_temp_emails.items()]
+
+        for uid, emails in snapshot:
+            for entry in emails:
+                email = entry["email"]
+                last_id = entry.get("last_mail_id")
+
+                try:
+                    mail = fetch_latest_mail(email)
+                except Exception:
+                    continue
+
+                if not mail:
+                    continue
+
+                mid = mail.get("mail_id")
+                if mid == last_id:
+                    continue
+
+                body = fetch_mail_content(email, mid)
+                subject = mail.get("subject", "") or ""
+                otp = extract_otp_temp(body) or extract_otp_temp(subject)
+
+                with temp_email_lock:
+                    if uid not in user_temp_emails:
+                        continue
+                    for e in user_temp_emails[uid]["emails"]:
+                        if e["email"] == email:
+                            e["last_mail_id"] = mid
+                            break
+
+                text = (
+                    f"📩 <b>New Email</b>\n\n"
+                    f"📧 <b>To:</b> <code>{escape(email)}</code>\n"
+                    f"📤 <b>From:</b> {escape(mail.get('from_mail',''))}\n"
+                    f"📌 <b>Subject:</b> {escape(subject)}\n"
+                )
+
+                if otp:
+                    text += f"\n🔑 <b>OTP:</b> <code>{otp}</code>\n"
+
+                text += f"\n<pre>{escape(body)}</pre>"
+
+                try:
+                    requests.post(f"{TG_API}/sendMessage",
+                                  data={'chat_id': uid, 'text': text, 'parse_mode': 'HTML'},
+                                  timeout=5)
+                except Exception:
+                    pass
+
+        time.sleep(FETCH_INTERVAL)
+
+def temp_cleanup():
+    while True:
+        now = time.time()
+        with temp_email_lock:
+            to_del = []
+            for uid, info in user_temp_emails.items():
+                if now - info.get("last_active", now) > INACTIVE_TIMEOUT:
+                    to_del.append(uid)
+            for uid in to_del:
+                del user_temp_emails[uid]
+        time.sleep(300)
+
+# Start background threads
+threading.Thread(target=temp_inbox_watcher, daemon=True).start()
+threading.Thread(target=temp_cleanup, daemon=True).start()
+
 # ---------- Telegram Bot Polling ----------
 def run_telegram_bot():
     offset = 0
@@ -815,6 +882,32 @@ def run_telegram_bot():
                                 msg, success = format_2fa_code(text)
                                 tg_send(chat_id, msg, main_keyboard(chat_id))
                                 continue
+                        elif step == 'awaiting_temp_domain':
+                            if text == '⬅️ Cancel':
+                                with states_lock:
+                                    user_states.pop(chat_id, None)
+                                tg_send(chat_id, 'Cancelled.', main_keyboard(chat_id))
+                                continue
+                            if text not in AVAILABLE_DOMAINS:
+                                tg_send(chat_id, 'Please select a domain from the list.', temp_domain_keyboard())
+                                continue
+                            email = generate_temp_email(text)
+                            with temp_email_lock:
+                                if chat_id not in user_temp_emails:
+                                    user_temp_emails[chat_id] = {"emails": [], "last_active": time.time()}
+                                user_temp_emails[chat_id]["emails"].append({
+                                    "email": email,
+                                    "last_mail_id": None
+                                })
+                                # Keep only last MAX_EMAILS
+                                user_temp_emails[chat_id]["emails"] = user_temp_emails[chat_id]["emails"][-MAX_EMAILS:]
+                                user_temp_emails[chat_id]["last_active"] = time.time()
+                            with states_lock:
+                                user_states.pop(chat_id, None)
+                            tg_send(chat_id,
+                                    f"📧 <b>Your Temp Email</b>\n\n<code>{email}</code>\n\nInbox is monitored – new messages will appear here.",
+                                    main_keyboard(chat_id))
+                            continue
 
                     if text.startswith('/start'):
                         parts = text.split()
@@ -860,14 +953,14 @@ def run_telegram_bot():
                     elif text == '🔐 Get 2FA':
                         with states_lock:
                             user_states[chat_id] = {'step': 'awaiting_2fa_secret'}
-                        instruction = """📲 <b>পেস্ট করুন আপনার 2FA Secret Key</b>
+                        instruction = """📲 <b>Paste your 2FA Secret Key</b>
 
 <code>ABCD EFGH IJKL MNOP QRS2 TUV7</code>
 <i>(Copy the format above)</i>
 
-📌 <b>নিবন্ধন:</b>
-• শুধুমাত্র A-Z এবং 2-7 ব্যবহার করুন
-• স্পেস দেওয়া যাবে বা না দেওয়াও যাবে
+📌 <b>Note:</b>
+• Only A-Z and 2-7
+• Spaces allowed or not
 
 <i>Example: JBSW Y3DP FH5Q VKBF H3TE 2SYW</i>"""
                         tg_send(chat_id, instruction, {'keyboard': [[{'text': '⬅️ Back'}]], 'resize_keyboard': True})
@@ -882,14 +975,10 @@ def run_telegram_bot():
                             handle_logout(chat_id)
                         else:
                             start_login(chat_id)
-                    elif text == '🆘 Support':
-                        support_msg = f"""🆘 <b>Support Information</b>
-
-For any assistance, please contact:
-{SUPPORT_USERNAME}
-
-<i>We're here to help you 24/7!</i>"""
-                        tg_send(chat_id, support_msg, main_keyboard(chat_id))
+                    elif text == '📧 Temp Mail':
+                        with states_lock:
+                            user_states[chat_id] = {'step': 'awaiting_temp_domain'}
+                        tg_send(chat_id, '🌐 <b>Select a domain for your temporary email:</b>', temp_domain_keyboard())
 
                 elif 'callback_query' in update:
                     cq = update['callback_query']
