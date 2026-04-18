@@ -1,5 +1,7 @@
+# bot.py – Optimised Telegram SMS Bot for Railway
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import requests, time, re, random, os, json, logging, threading, pyotp, string, sqlite3
 from datetime import datetime, timedelta
@@ -7,16 +9,18 @@ from html import escape, unescape
 from collections import defaultdict
 from dotenv import load_dotenv
 from faker import Faker
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# Suppress logs
+# ---------- Logging suppression ----------
 logging.getLogger().setLevel(logging.CRITICAL)
 for logger_name in ['urllib3', 'requests', 'faker', 'pyotp']:
     logging.getLogger(logger_name).setLevel(logging.CRITICAL)
 
 load_dotenv()
 
-# ---------- Environment Validation ----------
+# ---------- Environment ----------
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_ID = os.getenv('GROUP_ID')
 TIMEOUT_SECONDS = int(os.getenv('TIMEOUT_SECONDS', 600))
@@ -34,62 +38,36 @@ if not DEFAULT_MNIT_EMAIL or not DEFAULT_MNIT_PASSWORD:
     raise EnvironmentError('MNIT_EMAIL and MNIT_PASSWORD are required')
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-
 try:
-    bot_info = requests.get(f"{TG_API}/getMe").json()
+    bot_info = requests.get(f"{TG_API}/getMe", timeout=10).json()
     BOT_USERNAME = bot_info['result']['username']
 except Exception:
     BOT_USERNAME = None
 
-# ---------- Database Setup ----------
+# ---------- Database with WAL mode ----------
 DB_FILE = os.environ.get('DB_PATH', 'user_creds.db')
 db_dir = os.path.dirname(DB_FILE)
 if db_dir and not os.path.exists(db_dir):
-    try:
-        os.makedirs(db_dir, exist_ok=True)
-        print(f"[INFO] Created database directory: {db_dir}")
-    except Exception as e:
-        print(f"[WARN] Could not create {db_dir}: {e}. Falling back to local file.")
-        DB_FILE = 'user_creds.db'
+    os.makedirs(db_dir, exist_ok=True)
 
 db_lock = threading.Lock()
 
 def init_db():
-    global DB_FILE  # Fix: declare global at function start
     with db_lock:
-        try:
-            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-            c = conn.cursor()
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS user_credentials (
-                    user_id INTEGER,
-                    provider TEXT,
-                    email TEXT,
-                    password TEXT,
-                    PRIMARY KEY (user_id, provider)
-                )
-            ''')
-            conn.commit()
-            conn.close()
-            print(f"[INFO] Database initialized at {DB_FILE}")
-        except sqlite3.OperationalError as e:
-            print(f"[FATAL] Could not open database {DB_FILE}: {e}")
-            # Fallback to local file
-            DB_FILE = 'user_creds.db'
-            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-            c = conn.cursor()
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS user_credentials (
-                    user_id INTEGER,
-                    provider TEXT,
-                    email TEXT,
-                    password TEXT,
-                    PRIMARY KEY (user_id, provider)
-                )
-            ''')
-            conn.commit()
-            conn.close()
-            print(f"[INFO] Fallback database initialized at {DB_FILE}")
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        conn.execute('PRAGMA journal_mode=WAL')
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS user_credentials (
+                user_id INTEGER,
+                provider TEXT,
+                email TEXT,
+                password TEXT,
+                PRIMARY KEY (user_id, provider)
+            )
+        ''')
+        conn.commit()
+        conn.close()
 
 init_db()
 
@@ -125,7 +103,7 @@ def delete_credentials(user_id, provider=None):
         conn.commit()
         conn.close()
 
-# ---------- Thread-safe structures ----------
+# ---------- Thread‑safe globals ----------
 bot_instances = {}
 instances_lock = threading.RLock()
 user_states = {}
@@ -133,9 +111,11 @@ states_lock = threading.RLock()
 user_last_request = defaultdict(float)
 user_latest_range = {}
 user_latest_provider = {}
-RATE_LIMIT_SECONDS = 15
+RATE_LIMIT_SECONDS = 10           # slightly reduced for faster repeat
 
-executor = ThreadPoolExecutor(max_workers=10)
+# Thread pool for background tasks (limits concurrent waits)
+executor = ThreadPoolExecutor(max_workers=50)   # enough for many users
+
 fake = Faker('en_US')
 
 OTP_PATTERN = re.compile(
@@ -147,19 +127,19 @@ OTP_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-# ---------- TempMail Settings ----------
+# ---------- TempMail ----------
 AVAILABLE_DOMAINS = [
     "mailto.plus","fexpost.com","fexbox.org","mailbox.in.ua",
     "rover.info","chitthi.in","fextemp.com","any.pink","merepost.com"
 ]
 MAX_EMAILS = 5
-INACTIVE_TIMEOUT = 30 * 60  # seconds
-FETCH_INTERVAL = 2  # seconds
+INACTIVE_TIMEOUT = 30 * 60
+FETCH_INTERVAL = 2
 
-user_temp_emails = {}        # user_id -> {"emails": [...], "last_active": timestamp}
+user_temp_emails = {}
 temp_email_lock = threading.RLock()
 
-# ---------- Helper Functions ----------
+# ---------- Helpers ----------
 def clean_number(number):
     return number.lstrip('+').strip() if number else number
 
@@ -185,11 +165,6 @@ def generate_identity(gender):
     username = f"{first_name.lower()}{last_name.lower()}{random.randint(10,99)}"
     password = generate_strong_password()
     return emoji, full_name, username, password
-
-# ---------- TempMail Helpers ----------
-def generate_temp_email(domain):
-    local = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=10))
-    return f"{local}@{domain}"
 
 def clean_html(raw_html):
     raw_html = re.sub(r"<(script|style).*?>.*?</\\1>", "", raw_html, flags=re.S)
@@ -239,31 +214,38 @@ def fetch_mail_content(email, mail_id):
     except Exception:
         return ""
 
-# ---------- StexSMS Class (unchanged) ----------
+# ---------- Optimised StexSMS with aggressive retries ----------
 class StexSMS:
     def __init__(self, provider, email, password):
         self.provider = provider
         self.email = email
         self.password = password
-
-        if provider == 'mnitnetwork':
-            self.base = 'https://x.mnitnetwork.com'
-            self.use_headers = True
-        else:
-            self.base = 'https://stexsms.com'
-            self.use_headers = False
-
-        self.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=20, pool_maxsize=20, max_retries=2, pool_block=False
-        )
-        self.session.mount('https://', adapter)
-
+        self.base = 'https://x.mnitnetwork.com' if provider == 'mnitnetwork' else 'https://stexsms.com'
+        self.use_headers = (provider == 'mnitnetwork')
+        self.session = self._create_session()
         self.token = None
         self.token_time = None
         self.TOKEN_TTL = 3600
         self._lock = threading.RLock()
         self._range_cache = {'data': None, 'timestamp': 0}
+
+    def _create_session(self):
+        session = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"]
+        )
+        adapter = HTTPAdapter(
+            pool_connections=30,
+            pool_maxsize=30,
+            max_retries=retry,
+            pool_block=False
+        )
+        session.mount('https://', adapter)
+        session.mount('http://', adapter)
+        return session
 
     def _headers(self):
         h = {'Mauthtoken': self.token}
@@ -285,46 +267,56 @@ class StexSMS:
         url = f"{self.base}/mapi/v1/mauth/login"
         payload = {'email': self.email, 'password': self.password}
         headers = {'User-Agent': 'Mozilla/5.0'} if self.use_headers else None
-
-        response = self.session.post(url, json=payload, headers=headers, timeout=15)
-        response.raise_for_status()
-
-        data = response.json()
-        self.token = (data.get('token') or
-                      data.get('access_token') or
-                      data.get('data', {}).get('token') or
-                      self.session.cookies.get('mauthtoken'))
-        if not self.token:
-            raise RuntimeError('Failed to get token')
-        self.token_time = time.time()
+        for attempt in range(3):
+            try:
+                response = self.session.post(url, json=payload, headers=headers, timeout=20)
+                response.raise_for_status()
+                data = response.json()
+                self.token = (data.get('token') or
+                              data.get('access_token') or
+                              data.get('data', {}).get('token') or
+                              self.session.cookies.get('mauthtoken'))
+                if not self.token:
+                    raise RuntimeError('No token in response')
+                self.token_time = time.time()
+                return
+            except (requests.Timeout, requests.ConnectionError) as e:
+                if attempt == 2:
+                    raise RuntimeError(f"Login failed after retries: {e}")
+                time.sleep(1)
+            except Exception as e:
+                raise RuntimeError(f"Login error: {e}")
 
     def _request(self, method, url, **kwargs):
         self.ensure_auth()
         kwargs.setdefault('headers', self._headers())
         kwargs.setdefault('timeout', 25)
-
-        for attempt in range(2):
-            response = self.session.request(method, url, **kwargs)
-            if response.status_code == 200:
-                return response
-            elif response.status_code == 401 and attempt == 0:
-                with self._lock:
-                    self.token = None
-                    self.token_time = None
-                self.ensure_auth()
-                kwargs['headers'] = self._headers()
-                continue
-            elif response.status_code == 429:
-                time.sleep(2)
-                continue
-            response.raise_for_status()
+        for attempt in range(3):
+            try:
+                response = self.session.request(method, url, **kwargs)
+                if response.status_code == 200:
+                    return response
+                elif response.status_code == 401 and attempt < 2:
+                    with self._lock:
+                        self.token = None
+                        self.token_time = None
+                    self.ensure_auth()
+                    kwargs['headers'] = self._headers()
+                    continue
+                elif response.status_code == 429:
+                    time.sleep(2)
+                    continue
+                response.raise_for_status()
+            except (requests.Timeout, requests.ConnectionError):
+                if attempt == 2:
+                    raise
+                time.sleep(1)
         return response
 
     def get_random_range(self):
         now = time.time()
         if self._range_cache['data'] and now - self._range_cache['timestamp'] < 300:
             return self._range_cache['data']
-
         response = self._request('GET', f"{self.base}/mapi/v1/mdashboard/console/info")
         logs = response.json().get('data', {}).get('logs', [])
         ranges = [log['number'] for log in logs if 'XXX' in log.get('number', '')]
@@ -367,7 +359,6 @@ class StexSMS:
         start = time.time()
         poll_interval = 2
         empty_success_count = 0
-
         while time.time() - start < timeout:
             elapsed = int(time.time() - start)
             try:
@@ -388,7 +379,6 @@ class StexSMS:
                             if empty_success_count > 15:
                                 return None, None
                     break
-
                 if elapsed > 30:
                     poll_interval = 3
                 if elapsed > 60:
@@ -400,7 +390,7 @@ class StexSMS:
             time.sleep(poll_interval)
         return None, None
 
-# ---------- Bot Instance Management ----------
+# ---------- Bot instance manager with warm‑up ----------
 def get_bot_instance(provider, user_id=None):
     cache_key = (provider, user_id) if user_id else (provider, 'default')
     with instances_lock:
@@ -421,7 +411,7 @@ def get_bot_instance(provider, user_id=None):
                 email, password = DEFAULT_MNIT_EMAIL, DEFAULT_MNIT_PASSWORD
 
         bot = StexSMS(provider=provider, email=email, password=password)
-        bot.login()
+        bot.login()                     # immediate login
         bot_instances[cache_key] = bot
         return bot
 
@@ -433,7 +423,15 @@ def logout_user(user_id, provider=None):
         for k in keys_to_del:
             del bot_instances[k]
 
-# ---------- Rate Limiting ----------
+def warmup_default_bots():
+    """Pre‑login default accounts so first user request is fast."""
+    try:
+        get_bot_instance('stexsms')
+        get_bot_instance('mnitnetwork')
+    except Exception as e:
+        print(f"Warmup warning: {e}")
+
+# ---------- Rate limit ----------
 def check_rate_limit(chat_id):
     now = time.time()
     last = user_last_request[chat_id]
@@ -443,17 +441,11 @@ def check_rate_limit(chat_id):
     return True, 0
 
 def validate_range(range_str):
-    return bool(range_str and 'XXX' in range_str and re.match('^[\\dX]+$', range_str))
+    return bool(range_str and 'XXX' in range_str and re.match(r'^[\dX]+$', range_str))
 
 # ---------- Keyboards ----------
 def main_keyboard(user_id):
-    has_creds = False
-    for prov in ['stexsms', 'mnitnetwork']:
-        email, _ = get_credentials(user_id, prov)
-        if email:
-            has_creds = True
-            break
-
+    has_creds = any(get_credentials(user_id, p)[0] for p in ['stexsms', 'mnitnetwork'])
     login_text = '🔓 Logout' if has_creds else '🔐 Log IN'
     return {
         'keyboard': [
@@ -465,22 +457,13 @@ def main_keyboard(user_id):
     }
 
 def gender_keyboard():
-    return {
-        'keyboard': [[{'text': '👨 Male'}, {'text': '👩 Female'}], [{'text': '⬅️ Back'}]],
-        'resize_keyboard': True
-    }
+    return {'keyboard': [[{'text': '👨 Male'}, {'text': '👩 Female'}], [{'text': '⬅️ Back'}]], 'resize_keyboard': True}
 
 def provider_keyboard():
-    return {
-        'keyboard': [[{'text': '🌐 StexSMS'}, {'text': '🌐 MNIT Network'}], [{'text': '⬅️ Back'}]],
-        'resize_keyboard': True
-    }
+    return {'keyboard': [[{'text': '🌐 StexSMS'}, {'text': '🌐 MNIT Network'}], [{'text': '⬅️ Back'}]], 'resize_keyboard': True}
 
 def range_mode_keyboard():
-    return {
-        'keyboard': [[{'text': '🎲 Random Range'}, {'text': '✏️ Manual Range'}], [{'text': '⬅️ Back'}]],
-        'resize_keyboard': True
-    }
+    return {'keyboard': [[{'text': '🎲 Random Range'}, {'text': '✏️ Manual Range'}], [{'text': '⬅️ Back'}]], 'resize_keyboard': True}
 
 def number_options_keyboard(number):
     return {'inline_keyboard': [[{'text': 'OTP Group ↗️', 'url': 'https://t.me/otpservers'}]]}
@@ -491,10 +474,7 @@ def group_message_keyboard():
     return {'inline_keyboard': [[{'text': '🚀 Get Number', 'url': f'https://t.me/{BOT_USERNAME}?start=main'}]]}
 
 def login_provider_keyboard():
-    return {
-        'keyboard': [[{'text': '🌐 StexSMS'}, {'text': '🌐 MNIT Network'}], [{'text': '⬅️ Cancel'}]],
-        'resize_keyboard': True
-    }
+    return {'keyboard': [[{'text': '🌐 StexSMS'}, {'text': '🌐 MNIT Network'}], [{'text': '⬅️ Cancel'}]], 'resize_keyboard': True}
 
 def cancel_keyboard():
     return {'keyboard': [[{'text': '⬅️ Cancel'}]], 'resize_keyboard': True}
@@ -511,7 +491,7 @@ def temp_domain_keyboard():
     rows.append([{'text': '⬅️ Cancel'}])
     return {'keyboard': rows, 'resize_keyboard': True}
 
-# ---------- Message Formatters ----------
+# ---------- Message formatters ----------
 def format_inbox_message(number, provider, full_message, otp):
     t = datetime.now().strftime('%I:%M %p')
     msg = f"📩 <b>Message Received!</b>\n\n📞 <b>Number:</b> <code>+{number}</code>\n🏢 <b>Provider:</b> <code>{provider.upper()}</code>\n"
@@ -591,7 +571,7 @@ def tg_send(chat_id, text, keyboard=None, parse_mode='HTML'):
     except Exception:
         pass
 
-# ---------- Core Number Handling ----------
+# ---------- Core number handling ----------
 def handle_create_number(provider, chat_id, manual_range=None):
     try:
         allowed, remaining = check_rate_limit(chat_id)
@@ -640,12 +620,12 @@ def handle_create_number(provider, chat_id, manual_range=None):
             except Exception:
                 tg_send(chat_id, f"❌ Error: An error occurred", main_keyboard(chat_id))
 
-        threading.Thread(target=wait_and_send, daemon=True).start()
+        executor.submit(wait_and_send)
 
     except Exception as e:
         tg_send(chat_id, f"❌ Error: {escape(str(e))}", main_keyboard(chat_id))
 
-# ---------- Login Flow Handlers ----------
+# ---------- Login flow ----------
 def start_login(chat_id):
     with states_lock:
         user_states[chat_id] = {'step': 'awaiting_login_provider'}
@@ -657,7 +637,6 @@ def process_login_provider(chat_id, text):
             user_states.pop(chat_id, None)
         tg_send(chat_id, "Login cancelled.", main_keyboard(chat_id))
         return
-
     provider = 'stexsms' if 'Stex' in text else 'mnitnetwork'
     with states_lock:
         user_states[chat_id] = {'step': 'awaiting_login_email', 'provider': provider}
@@ -671,12 +650,10 @@ def process_login_email(chat_id, text, state):
             user_states.pop(chat_id, None)
         tg_send(chat_id, "Login cancelled.", main_keyboard(chat_id))
         return
-
     email = text.strip()
     if '@' not in email or '.' not in email:
         tg_send(chat_id, "❌ Invalid email format. Please try again or Cancel.", cancel_keyboard())
         return
-
     state['email'] = email
     state['step'] = 'awaiting_login_password'
     tg_send(chat_id,
@@ -689,11 +666,9 @@ def process_login_password(chat_id, text, state):
             user_states.pop(chat_id, None)
         tg_send(chat_id, "Login cancelled.", main_keyboard(chat_id))
         return
-
     password = text.strip()
     provider = state['provider']
     email = state['email']
-
     try:
         test_bot = StexSMS(provider=provider, email=email, password=password)
         test_bot.login()
@@ -701,16 +676,13 @@ def process_login_password(chat_id, text, state):
         tg_send(chat_id, f"❌ <b>Login failed:</b> {escape(str(e))}\n\nPlease check your credentials and try again.",
                 cancel_keyboard())
         return
-
     save_credentials(chat_id, provider, email, password)
     with instances_lock:
         cache_key = (provider, chat_id)
         if cache_key in bot_instances:
             del bot_instances[cache_key]
-
     with states_lock:
         user_states.pop(chat_id, None)
-
     provider_name = 'StexSMS' if provider == 'stexsms' else 'MNIT Network'
     tg_send(chat_id,
             f"✅ <b>Successfully logged into {provider_name}!</b>\n\nNow you can use your own account for numbers.",
@@ -720,33 +692,27 @@ def handle_logout(chat_id):
     logout_user(chat_id)
     tg_send(chat_id, "🔓 <b>You have been logged out.</b> Using default accounts again.", main_keyboard(chat_id))
 
-# ---------- TempMail Inbox Watcher (Background Thread) ----------
+# ---------- TempMail background ----------
 def temp_inbox_watcher():
     while True:
         with temp_email_lock:
             snapshot = [(uid, list(info.get("emails", []))) for uid, info in user_temp_emails.items()]
-
         for uid, emails in snapshot:
             for entry in emails:
                 email = entry["email"]
                 last_id = entry.get("last_mail_id")
-
                 try:
                     mail = fetch_latest_mail(email)
                 except Exception:
                     continue
-
                 if not mail:
                     continue
-
                 mid = mail.get("mail_id")
                 if mid == last_id:
                     continue
-
                 body = fetch_mail_content(email, mid)
                 subject = mail.get("subject", "") or ""
                 otp = extract_otp_temp(body) or extract_otp_temp(subject)
-
                 with temp_email_lock:
                     if uid not in user_temp_emails:
                         continue
@@ -754,46 +720,39 @@ def temp_inbox_watcher():
                         if e["email"] == email:
                             e["last_mail_id"] = mid
                             break
-
                 text = (
                     f"📩 <b>New Email</b>\n\n"
                     f"📧 <b>To:</b> <code>{escape(email)}</code>\n"
                     f"📤 <b>From:</b> {escape(mail.get('from_mail',''))}\n"
                     f"📌 <b>Subject:</b> {escape(subject)}\n"
                 )
-
                 if otp:
                     text += f"\n🔑 <b>OTP:</b> <code>{otp}</code>\n"
-
                 text += f"\n<pre>{escape(body)}</pre>"
-
                 try:
                     requests.post(f"{TG_API}/sendMessage",
                                   data={'chat_id': uid, 'text': text, 'parse_mode': 'HTML'},
                                   timeout=5)
                 except Exception:
                     pass
-
         time.sleep(FETCH_INTERVAL)
 
 def temp_cleanup():
     while True:
         now = time.time()
         with temp_email_lock:
-            to_del = []
-            for uid, info in user_temp_emails.items():
-                if now - info.get("last_active", now) > INACTIVE_TIMEOUT:
-                    to_del.append(uid)
+            to_del = [uid for uid, info in user_temp_emails.items()
+                      if now - info.get("last_active", now) > INACTIVE_TIMEOUT]
             for uid in to_del:
                 del user_temp_emails[uid]
         time.sleep(300)
 
-# Start background threads
 threading.Thread(target=temp_inbox_watcher, daemon=True).start()
 threading.Thread(target=temp_cleanup, daemon=True).start()
 
-# ---------- Telegram Bot Polling ----------
+# ---------- Telegram polling ----------
 def run_telegram_bot():
+    warmup_default_bots()
     offset = 0
     while True:
         try:
@@ -802,14 +761,11 @@ def run_telegram_bot():
                                     timeout=35)
             for update in response.json().get('result', []):
                 offset = update['update_id'] + 1
-
                 if 'message' in update:
                     text = update['message'].get('text', '').strip()
                     chat_id = update['message']['chat']['id']
-
                     with states_lock:
                         state = user_states.get(chat_id)
-
                     if state:
                         step = state.get('step')
                         if step == 'awaiting_login_provider':
@@ -899,7 +855,6 @@ def run_telegram_bot():
                                     "email": email,
                                     "last_mail_id": None
                                 })
-                                # Keep only last MAX_EMAILS
                                 user_temp_emails[chat_id]["emails"] = user_temp_emails[chat_id]["emails"][-MAX_EMAILS:]
                                 user_temp_emails[chat_id]["last_active"] = time.time()
                             with states_lock:
@@ -965,12 +920,7 @@ def run_telegram_bot():
 <i>Example: JBSW Y3DP FH5Q VKBF H3TE 2SYW</i>"""
                         tg_send(chat_id, instruction, {'keyboard': [[{'text': '⬅️ Back'}]], 'resize_keyboard': True})
                     elif text in ['🔐 Log IN', '🔓 Logout']:
-                        has_creds = False
-                        for prov in ['stexsms', 'mnitnetwork']:
-                            email, _ = get_credentials(chat_id, prov)
-                            if email:
-                                has_creds = True
-                                break
+                        has_creds = any(get_credentials(chat_id, p)[0] for p in ['stexsms', 'mnitnetwork'])
                         if has_creds:
                             handle_logout(chat_id)
                         else:
