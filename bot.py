@@ -1,4 +1,4 @@
-# bot.py – Optimised Telegram SMS Bot for Railway
+# bot.py – Optimised Telegram SMS Bot for Railway (Temp Mail Fixed)
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -9,7 +9,7 @@ from html import escape, unescape
 from collections import defaultdict
 from dotenv import load_dotenv
 from faker import Faker
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -111,11 +111,9 @@ states_lock = threading.RLock()
 user_last_request = defaultdict(float)
 user_latest_range = {}
 user_latest_provider = {}
-RATE_LIMIT_SECONDS = 10           # slightly reduced for faster repeat
+RATE_LIMIT_SECONDS = 10
 
-# Thread pool for background tasks (limits concurrent waits)
-executor = ThreadPoolExecutor(max_workers=50)   # enough for many users
-
+executor = ThreadPoolExecutor(max_workers=50)
 fake = Faker('en_US')
 
 OTP_PATTERN = re.compile(
@@ -165,6 +163,10 @@ def generate_identity(gender):
     username = f"{first_name.lower()}{last_name.lower()}{random.randint(10,99)}"
     password = generate_strong_password()
     return emoji, full_name, username, password
+
+def generate_temp_email(domain):
+    local = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=10))
+    return f"{local}@{domain}"
 
 def clean_html(raw_html):
     raw_html = re.sub(r"<(script|style).*?>.*?</\\1>", "", raw_html, flags=re.S)
@@ -411,7 +413,7 @@ def get_bot_instance(provider, user_id=None):
                 email, password = DEFAULT_MNIT_EMAIL, DEFAULT_MNIT_PASSWORD
 
         bot = StexSMS(provider=provider, email=email, password=password)
-        bot.login()                     # immediate login
+        bot.login()
         bot_instances[cache_key] = bot
         return bot
 
@@ -424,7 +426,6 @@ def logout_user(user_id, provider=None):
             del bot_instances[k]
 
 def warmup_default_bots():
-    """Pre‑login default accounts so first user request is fast."""
     try:
         get_bot_instance('stexsms')
         get_bot_instance('mnitnetwork')
