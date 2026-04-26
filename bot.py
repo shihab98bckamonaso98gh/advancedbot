@@ -1,4 +1,4 @@
-# bot.py – Optimised Telegram SMS Bot for Railway (Temp Mail Fixed)
+# bot.py – Optimised Telegram SMS Bot for Railway (Temp Mail Fixed + OTP Detection Improved)
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -116,14 +116,35 @@ RATE_LIMIT_SECONDS = 10
 executor = ThreadPoolExecutor(max_workers=50)
 fake = Faker('en_US')
 
+# ---------- Improved OTP Pattern (handles spaces & dashes) ----------
+# Matches:
+#   <#> 015 692 ...          → group 1
+#   code/otp/pin: 123-456   → group 2
+#   123 456 is your ...     → group 3
+#   XX-123                  → group 4 (alphanumeric OTPs)
+#   continuous 4‑8 digits   → group 5 (fallback)
 OTP_PATTERN = re.compile(
-    r'(?:<#>)\s*(\d{4,8})|'
-    r'(?:code|otp|pin|verification)[:\s]+(\d{4,8})|'
-    r'(\d{4,8})\s+is\s+your|'
+    r'<#>\s*(\d[\d\s-]{2,7}\d)\b|'
+    r'(?:code|otp|pin|verification)[:\s]+(\d[\d\s-]{2,7}\d)\b|'
+    r'(\d[\d\s-]{2,7}\d)\s+is\s+your|'
     r'([A-Z]{2,3}-\d+)|'
-    r'\b(\d{4,6})\b',
+    r'\b(\d{4,8})\b',
     re.IGNORECASE
 )
+
+def extract_otp_universal(text: str):
+    """Extract an OTP from a text string, cleaning spaces/dashes. Returns cleaned code or None."""
+    if not text:
+        return None
+    match = OTP_PATTERN.search(text)
+    if match:
+        for group in match.groups():
+            if group:
+                # Remove spaces and dashes, keep only digits
+                code = re.sub(r'[\s-]', '', group)
+                if code.isdigit() and 3 <= len(code) <= 8:
+                    return code
+    return None
 
 # ---------- TempMail ----------
 AVAILABLE_DOMAINS = [
@@ -176,8 +197,8 @@ def clean_html(raw_html):
     return re.sub(r"\n{2,}", "\n", raw_html).strip()
 
 def extract_otp_temp(text):
-    m = re.search(r"\b\d{4,8}\b", text)
-    return m.group() if m else None
+    """Used for temp mail – now uses the universal extractor."""
+    return extract_otp_universal(text)
 
 def fetch_latest_mail(email):
     encoded = email.replace("@", "%40")
@@ -347,14 +368,8 @@ class StexSMS:
         return numbers if isinstance(numbers, list) else []
 
     def extract_otp(self, text):
-        if not text:
-            return None
-        match = OTP_PATTERN.search(text)
-        if match:
-            for group in match.groups():
-                if group:
-                    return group
-        return None
+        """Uses the universal OTP extractor."""
+        return extract_otp_universal(text)
 
     def wait_for_message(self, number, timeout=TIMEOUT_SECONDS):
         number = clean_number(number)
