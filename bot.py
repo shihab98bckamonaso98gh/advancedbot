@@ -1,4 +1,4 @@
-# bot.py – Optimised Telegram SMS Bot for Railway (Temp Mail Fixed + OTP Detection Improved)
+# bot.py – Optimised Telegram SMS Bot (Multi‑Group, Fast Fetch)
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -15,27 +15,27 @@ from urllib3.util.retry import Retry
 
 # ---------- Logging suppression ----------
 logging.getLogger().setLevel(logging.CRITICAL)
-for logger_name in ['urllib3', 'requests', 'faker', 'pyotp']:
-    logging.getLogger(logger_name).setLevel(logging.CRITICAL)
+for lname in ['urllib3', 'requests', 'faker', 'pyotp']:
+    logging.getLogger(lname).setLevel(logging.CRITICAL)
 
 load_dotenv()
 
 # ---------- Environment ----------
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-GROUP_ID = os.getenv('GROUP_ID')
+GROUP_IDS     = [gid.strip() for gid in os.getenv('GROUP_ID', '').split(',') if gid.strip()]
 TIMEOUT_SECONDS = int(os.getenv('TIMEOUT_SECONDS', 600))
 
-DEFAULT_STEX_EMAIL = os.getenv('STEX_EMAIL')
+DEFAULT_STEX_EMAIL    = os.getenv('STEX_EMAIL')
 DEFAULT_STEX_PASSWORD = os.getenv('STEX_PASSWORD')
-DEFAULT_MNIT_EMAIL = os.getenv('MNIT_EMAIL')
+DEFAULT_MNIT_EMAIL    = os.getenv('MNIT_EMAIL')
 DEFAULT_MNIT_PASSWORD = os.getenv('MNIT_PASSWORD')
 
 if not TELEGRAM_TOKEN:
-    raise EnvironmentError('TELEGRAM_TOKEN is required')
+    raise EnvironmentError('TELEGRAM_TOKEN required')
 if not DEFAULT_STEX_EMAIL or not DEFAULT_STEX_PASSWORD:
-    raise EnvironmentError('STEX_EMAIL and STEX_PASSWORD are required')
+    raise EnvironmentError('STEX_EMAIL and STEX_PASSWORD required')
 if not DEFAULT_MNIT_EMAIL or not DEFAULT_MNIT_PASSWORD:
-    raise EnvironmentError('MNIT_EMAIL and MNIT_PASSWORD are required')
+    raise EnvironmentError('MNIT_EMAIL and MNIT_PASSWORD required')
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 try:
@@ -44,7 +44,7 @@ try:
 except Exception:
     BOT_USERNAME = None
 
-# ---------- Database with WAL mode ----------
+# ---------- Database with WAL ----------
 DB_FILE = os.environ.get('DB_PATH', 'user_creds.db')
 db_dir = os.path.dirname(DB_FILE)
 if db_dir and not os.path.exists(db_dir):
@@ -59,16 +59,15 @@ def init_db():
         c = conn.cursor()
         c.execute('''
             CREATE TABLE IF NOT EXISTS user_credentials (
-                user_id INTEGER,
-                provider TEXT,
-                email TEXT,
-                password TEXT,
+                user_id   INTEGER,
+                provider  TEXT,
+                email     TEXT,
+                password  TEXT,
                 PRIMARY KEY (user_id, provider)
             )
         ''')
         conn.commit()
         conn.close()
-
 init_db()
 
 def save_credentials(user_id, provider, email, password):
@@ -104,10 +103,10 @@ def delete_credentials(user_id, provider=None):
         conn.close()
 
 # ---------- Thread‑safe globals ----------
-bot_instances = {}
-instances_lock = threading.RLock()
-user_states = {}
-states_lock = threading.RLock()
+bot_instances    = {}
+instances_lock   = threading.RLock()
+user_states      = {}
+states_lock      = threading.RLock()
 user_last_request = defaultdict(float)
 user_latest_range = {}
 user_latest_provider = {}
@@ -116,13 +115,7 @@ RATE_LIMIT_SECONDS = 10
 executor = ThreadPoolExecutor(max_workers=50)
 fake = Faker('en_US')
 
-# ---------- Improved OTP Pattern (handles spaces & dashes) ----------
-# Matches:
-#   <#> 015 692 ...          → group 1
-#   code/otp/pin: 123-456   → group 2
-#   123 456 is your ...     → group 3
-#   XX-123                  → group 4 (alphanumeric OTPs)
-#   continuous 4‑8 digits   → group 5 (fallback)
+# ---------- Improved OTP Pattern ----------
 OTP_PATTERN = re.compile(
     r'<#>\s*(\d[\d\s-]{2,7}\d)\b|'
     r'(?:code|otp|pin|verification)[:\s]+(\d[\d\s-]{2,7}\d)\b|'
@@ -133,14 +126,12 @@ OTP_PATTERN = re.compile(
 )
 
 def extract_otp_universal(text: str):
-    """Extract an OTP from a text string, cleaning spaces/dashes. Returns cleaned code or None."""
     if not text:
         return None
     match = OTP_PATTERN.search(text)
     if match:
         for group in match.groups():
             if group:
-                # Remove spaces and dashes, keep only digits
                 code = re.sub(r'[\s-]', '', group)
                 if code.isdigit() and 3 <= len(code) <= 8:
                     return code
@@ -158,7 +149,6 @@ FETCH_INTERVAL = 2
 user_temp_emails = {}
 temp_email_lock = threading.RLock()
 
-# ---------- Helpers ----------
 def clean_number(number):
     return number.lstrip('+').strip() if number else number
 
@@ -190,14 +180,13 @@ def generate_temp_email(domain):
     return f"{local}@{domain}"
 
 def clean_html(raw_html):
-    raw_html = re.sub(r"<(script|style).*?>.*?</\\1>", "", raw_html, flags=re.S)
-    raw_html = re.sub(r"<br\\s*/?>|</p>", "\n", raw_html)
+    raw_html = re.sub(r"<(script|style).*?>.*?</\1>", "", raw_html, flags=re.S)
+    raw_html = re.sub(r"<br\s*/?>|</p>", "\n", raw_html)
     raw_html = re.sub(r"<[^>]+>", "", raw_html)
     raw_html = unescape(raw_html)
     return re.sub(r"\n{2,}", "\n", raw_html).strip()
 
 def extract_otp_temp(text):
-    """Used for temp mail – now uses the universal extractor."""
     return extract_otp_universal(text)
 
 def fetch_latest_mail(email):
@@ -237,7 +226,7 @@ def fetch_mail_content(email, mail_id):
     except Exception:
         return ""
 
-# ---------- Optimised StexSMS with aggressive retries ----------
+# ---------- StexSMS Class (with speed optimisations) ----------
 class StexSMS:
     def __init__(self, provider, email, password):
         self.provider = provider
@@ -255,14 +244,14 @@ class StexSMS:
     def _create_session(self):
         session = requests.Session()
         retry = Retry(
-            total=3,
-            backoff_factor=1,
+            total=2,
+            backoff_factor=0.5,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET", "POST"]
         )
         adapter = HTTPAdapter(
-            pool_connections=30,
-            pool_maxsize=30,
+            pool_connections=50,
+            pool_maxsize=50,
             max_retries=retry,
             pool_block=False
         )
@@ -274,7 +263,7 @@ class StexSMS:
         h = {'Mauthtoken': self.token}
         if self.use_headers:
             h.update({
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'User-Agent': 'Mozilla/5.0',
                 'Content-Type': 'application/json',
                 'Accept-Encoding': 'gzip, deflate',
                 'Connection': 'keep-alive'
@@ -292,7 +281,7 @@ class StexSMS:
         headers = {'User-Agent': 'Mozilla/5.0'} if self.use_headers else None
         for attempt in range(3):
             try:
-                response = self.session.post(url, json=payload, headers=headers, timeout=20)
+                response = self.session.post(url, json=payload, headers=headers, timeout=15)
                 response.raise_for_status()
                 data = response.json()
                 self.token = (data.get('token') or
@@ -306,20 +295,20 @@ class StexSMS:
             except (requests.Timeout, requests.ConnectionError) as e:
                 if attempt == 2:
                     raise RuntimeError(f"Login failed after retries: {e}")
-                time.sleep(1)
+                time.sleep(0.5)
             except Exception as e:
                 raise RuntimeError(f"Login error: {e}")
 
     def _request(self, method, url, **kwargs):
         self.ensure_auth()
         kwargs.setdefault('headers', self._headers())
-        kwargs.setdefault('timeout', 25)
-        for attempt in range(3):
+        kwargs.setdefault('timeout', 20)
+        for attempt in range(2):
             try:
                 response = self.session.request(method, url, **kwargs)
                 if response.status_code == 200:
                     return response
-                elif response.status_code == 401 and attempt < 2:
+                elif response.status_code == 401 and attempt == 0:
                     with self._lock:
                         self.token = None
                         self.token_time = None
@@ -327,13 +316,13 @@ class StexSMS:
                     kwargs['headers'] = self._headers()
                     continue
                 elif response.status_code == 429:
-                    time.sleep(2)
+                    time.sleep(1)
                     continue
                 response.raise_for_status()
             except (requests.Timeout, requests.ConnectionError):
-                if attempt == 2:
+                if attempt == 1:
                     raise
-                time.sleep(1)
+                time.sleep(0.5)
         return response
 
     def get_random_range(self):
@@ -368,13 +357,11 @@ class StexSMS:
         return numbers if isinstance(numbers, list) else []
 
     def extract_otp(self, text):
-        """Uses the universal OTP extractor."""
         return extract_otp_universal(text)
 
     def wait_for_message(self, number, timeout=TIMEOUT_SECONDS):
         number = clean_number(number)
         start = time.time()
-        poll_interval = 2
         empty_success_count = 0
         while time.time() - start < timeout:
             elapsed = int(time.time() - start)
@@ -393,27 +380,29 @@ class StexSMS:
                             return msg, otp
                         else:
                             empty_success_count += 1
-                            if empty_success_count > 15:
+                            if empty_success_count > 6:   # faster fail after 6 empty successes
                                 return None, None
                     break
-                if elapsed > 30:
-                    poll_interval = 3
-                if elapsed > 60:
-                    poll_interval = 4
-                if elapsed > 120:
-                    poll_interval = 5
+                # Faster, adaptive polling
+                if elapsed < 15:
+                    poll = 1.5
+                elif elapsed < 45:
+                    poll = 2
+                elif elapsed < 90:
+                    poll = 3
+                else:
+                    poll = 4
             except Exception:
-                pass
-            time.sleep(poll_interval)
+                poll = 2
+            time.sleep(poll)
         return None, None
 
-# ---------- Bot instance manager with warm‑up ----------
+# ---------- Bot instance manager ----------
 def get_bot_instance(provider, user_id=None):
     cache_key = (provider, user_id) if user_id else (provider, 'default')
     with instances_lock:
         if cache_key in bot_instances:
             return bot_instances[cache_key]
-
         if user_id:
             email, password = get_credentials(user_id, provider)
             if not email or not password:
@@ -426,7 +415,6 @@ def get_bot_instance(provider, user_id=None):
                 email, password = DEFAULT_STEX_EMAIL, DEFAULT_STEX_PASSWORD
             else:
                 email, password = DEFAULT_MNIT_EMAIL, DEFAULT_MNIT_PASSWORD
-
         bot = StexSMS(provider=provider, email=email, password=password)
         bot.login()
         bot_instances[cache_key] = bot
@@ -570,11 +558,10 @@ Your Code : <code>{code}</code>
 
 ⏱ Valid for: <b>{time_remaining} seconds</b>
 
-📌 <b>Note:</b> This code refreshes every 30 seconds.
-You can request a new code at any time."""
+📌 <b>Note:</b> This code refreshes every 30 seconds."""
         return msg, True
     except Exception:
-        return "❌ <b>Invalid Secret Key!</b>\n\nPlease check your format and try again.", False
+        return "❌ <b>Invalid Secret Key!</b>\n\nCheck format and try again.", False
 
 def tg_send(chat_id, text, keyboard=None, parse_mode='HTML'):
     if not chat_id:
@@ -586,6 +573,11 @@ def tg_send(chat_id, text, keyboard=None, parse_mode='HTML'):
         requests.post(f"{TG_API}/sendMessage", data=data, timeout=5)
     except Exception:
         pass
+
+def send_to_all_groups(text, keyboard=None):
+    """Send a message to every group ID in the .env list."""
+    for gid in GROUP_IDS:
+        tg_send(gid, text, keyboard)
 
 # ---------- Core number handling ----------
 def handle_create_number(provider, chat_id, manual_range=None):
@@ -617,8 +609,9 @@ def handle_create_number(provider, chat_id, manual_range=None):
                 msg, otp = bot.wait_for_message(number, timeout=TIMEOUT_SECONDS)
                 if msg:
                     tg_send(chat_id, format_inbox_message(number, provider, msg, otp), main_keyboard(chat_id))
-                    if GROUP_ID:
-                        tg_send(GROUP_ID, format_group_message(number, provider, msg, otp), group_message_keyboard())
+                    # Forward to ALL groups (multi‑group support)
+                    if GROUP_IDS:
+                        send_to_all_groups(format_group_message(number, provider, msg, otp), group_message_keyboard())
                 else:
                     try:
                         nums = bot.get_numbers_info(search=number)
@@ -668,7 +661,7 @@ def process_login_email(chat_id, text, state):
         return
     email = text.strip()
     if '@' not in email or '.' not in email:
-        tg_send(chat_id, "❌ Invalid email format. Please try again or Cancel.", cancel_keyboard())
+        tg_send(chat_id, "❌ Invalid email format. Try again or Cancel.", cancel_keyboard())
         return
     state['email'] = email
     state['step'] = 'awaiting_login_password'
@@ -689,8 +682,7 @@ def process_login_password(chat_id, text, state):
         test_bot = StexSMS(provider=provider, email=email, password=password)
         test_bot.login()
     except Exception as e:
-        tg_send(chat_id, f"❌ <b>Login failed:</b> {escape(str(e))}\n\nPlease check your credentials and try again.",
-                cancel_keyboard())
+        tg_send(chat_id, f"❌ <b>Login failed:</b> {escape(str(e))}\n\nCheck your credentials.", cancel_keyboard())
         return
     save_credentials(chat_id, provider, email, password)
     with instances_lock:
@@ -699,14 +691,12 @@ def process_login_password(chat_id, text, state):
             del bot_instances[cache_key]
     with states_lock:
         user_states.pop(chat_id, None)
-    provider_name = 'StexSMS' if provider == 'stexsms' else 'MNIT Network'
-    tg_send(chat_id,
-            f"✅ <b>Successfully logged into {provider_name}!</b>\n\nNow you can use your own account for numbers.",
-            main_keyboard(chat_id))
+    name = 'StexSMS' if provider == 'stexsms' else 'MNIT Network'
+    tg_send(chat_id, f"✅ <b>Logged into {name}!</b>", main_keyboard(chat_id))
 
 def handle_logout(chat_id):
     logout_user(chat_id)
-    tg_send(chat_id, "🔓 <b>You have been logged out.</b> Using default accounts again.", main_keyboard(chat_id))
+    tg_send(chat_id, "🔓 <b>Logged out.</b> Using default accounts.", main_keyboard(chat_id))
 
 # ---------- TempMail background ----------
 def temp_inbox_watcher():
@@ -800,7 +790,7 @@ def run_telegram_bot():
                                 tg_send(chat_id, 'Select provider:', provider_keyboard())
                                 continue
                             if not validate_range(text):
-                                tg_send(chat_id, '❌ Invalid range!\n\nMust contain <b>XXX</b> and only digits/X.\nExample: <code>2250163333XXX</code>')
+                                tg_send(chat_id, '❌ Invalid range!\nMust contain <b>XXX</b> and only digits/X.\nExample: <code>2250163333XXX</code>')
                                 continue
                             prov = state['provider']
                             with states_lock:
@@ -906,7 +896,7 @@ def run_telegram_bot():
                             handle_create_number(latest_provider, chat_id, manual_range=latest_range)
                         else:
                             tg_send(chat_id,
-                                    "❌ No manual range found.\n\nPlease use <b>📞 Get Number</b> with <b>✏️ Manual Range</b> first.",
+                                    "❌ No manual range found.\nPlease use <b>📞 Get Number</b> with <b>✏️ Manual Range</b> first.",
                                     main_keyboard(chat_id))
                         continue
                     elif text == '🌐 StexSMS':
