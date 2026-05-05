@@ -619,8 +619,8 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
         # after loop: send appropriate final message
         if failed:
             tg_send(chat_id, format_failed_message(number, provider_name))
-        elif not cancel_evt.is_set():
-            tg_send(chat_id, format_timeout_message(number, provider_name))
+        # Timeout without receiving any message → do nothing (no longer disturb user)
+        # (previously sent format_timeout_message)
     except Exception as e:
         tg_send(chat_id, f"❌ Monitoring error for +{number}: {escape(str(e))}")
     finally:
