@@ -1,4 +1,4 @@
-# bot.py – Optimised Telegram SMS Bot (Multi‑Group, Fast Fetch)
+# bot.py – Optimised Telegram SMS Bot (Multi‑Number, Continuous Monitoring)
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -111,6 +111,11 @@ user_last_request = defaultdict(float)
 user_latest_range = {}
 user_latest_provider = {}
 RATE_LIMIT_SECONDS = 10
+
+# Multi-number monitoring
+MAX_ACTIVE_NUMBERS = 5
+active_monitors = {}      # chat_id -> { number: {'future':Future, 'cancel':Event, 'provider':str, 'start':float} }
+monitors_lock = threading.RLock()
 
 executor = ThreadPoolExecutor(max_workers=50)
 fake = Faker('en_US')
@@ -359,44 +364,6 @@ class StexSMS:
     def extract_otp(self, text):
         return extract_otp_universal(text)
 
-    def wait_for_message(self, number, timeout=TIMEOUT_SECONDS):
-        number = clean_number(number)
-        start = time.time()
-        empty_success_count = 0
-        while time.time() - start < timeout:
-            elapsed = int(time.time() - start)
-            try:
-                numbers = self.get_numbers_info(search=number)
-                for n in numbers:
-                    if clean_number(n.get('number', '')) != number:
-                        continue
-                    status = n.get('status', '')
-                    msg = n.get('message') or n.get('otp') or ''
-                    if status == 'failed':
-                        return None, None
-                    if status == 'success':
-                        if msg:
-                            otp = self.extract_otp(msg)
-                            return msg, otp
-                        else:
-                            empty_success_count += 1
-                            if empty_success_count > 6:   # faster fail after 6 empty successes
-                                return None, None
-                    break
-                # Faster, adaptive polling
-                if elapsed < 15:
-                    poll = 1.5
-                elif elapsed < 45:
-                    poll = 2
-                elif elapsed < 90:
-                    poll = 3
-                else:
-                    poll = 4
-            except Exception:
-                poll = 2
-            time.sleep(poll)
-        return None, None
-
 # ---------- Bot instance manager ----------
 def get_bot_instance(provider, user_id=None):
     cache_key = (provider, user_id) if user_id else (provider, 'default')
@@ -579,6 +546,114 @@ def send_to_all_groups(text, keyboard=None):
     for gid in GROUP_IDS:
         tg_send(gid, text, keyboard)
 
+# ---------- Multi‑number background monitoring ----------
+def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
+    """
+    Background thread: continuously poll the number for new messages,
+    forward them to user and groups, and stop after timeout.
+    """
+    cancel_evt = None
+    try:
+        bot = get_bot_instance(provider_name, user_id=chat_id)
+        # register in active_monitors
+        with monitors_lock:
+            if chat_id not in active_monitors:
+                active_monitors[chat_id] = {}
+            # prevent duplicate monitoring of the same number
+            if number in active_monitors[chat_id]:
+                # already being monitored, nothing to do
+                return
+            cancel_evt = threading.Event()
+            active_monitors[chat_id][number] = {
+                'future': None,   # will be set later
+                'cancel': cancel_evt,
+                'provider': provider_name,
+                'start': start_time
+            }
+
+        last_msg_text = ""   # track to avoid duplicate messages
+        timeout = TIMEOUT_SECONDS
+        failed = False
+        next_poll = 2
+
+        while time.time() - start_time < timeout and not cancel_evt.is_set():
+            try:
+                nums = bot.get_numbers_info(search=number)
+                for n in nums:
+                    if clean_number(n.get('number', '')) != number:
+                        continue
+                    status = n.get('status', '')
+                    msg = n.get('message') or n.get('otp') or ''
+                    if status == 'failed':
+                        failed = True
+                        break
+                    if status == 'success' and msg and msg != last_msg_text:
+                        last_msg_text = msg
+                        otp = bot.extract_otp(msg)
+                        # send to user
+                        tg_send(chat_id, format_inbox_message(number, provider_name, msg, otp), number_options_keyboard(number))
+                        # forward to all groups if OTP exists
+                        if otp and GROUP_IDS:
+                            send_to_all_groups(format_group_message(number, provider_name, msg, otp), group_message_keyboard())
+                    # else: no new message, continue polling
+                if failed:
+                    break
+            except Exception as e:
+                # log error and continue polling (maybe temporary network issue)
+                pass
+
+            # adaptive sleep
+            elapsed = time.time() - start_time
+            if elapsed < 15:
+                sleep_time = 1.5
+            elif elapsed < 45:
+                sleep_time = 2
+            elif elapsed < 90:
+                sleep_time = 3
+            else:
+                sleep_time = 4
+            # wait with cancellation check
+            if cancel_evt.wait(sleep_time):
+                break
+
+        # after loop: send appropriate final message
+        if failed:
+            tg_send(chat_id, format_failed_message(number, provider_name))
+        elif not cancel_evt.is_set():
+            tg_send(chat_id, format_timeout_message(number, provider_name))
+    except Exception as e:
+        tg_send(chat_id, f"❌ Monitoring error for +{number}: {escape(str(e))}")
+    finally:
+        # clean up monitoring entry
+        with monitors_lock:
+            if chat_id in active_monitors and number in active_monitors[chat_id]:
+                del active_monitors[chat_id][number]
+                if not active_monitors[chat_id]:
+                    del active_monitors[chat_id]
+
+def start_number_monitoring(chat_id, number, provider_name, range_used):
+    """
+    Queue a new monitoring task, respecting max active numbers.
+    """
+    with monitors_lock:
+        if chat_id not in active_monitors:
+            active_monitors[chat_id] = {}
+        # check global limit
+        if len(active_monitors[chat_id]) >= MAX_ACTIVE_NUMBERS:
+            tg_send(chat_id, f"❌ You already have {MAX_ACTIVE_NUMBERS} numbers being monitored. Wait for one to finish.",
+                    main_keyboard(chat_id))
+            return
+        # if number already exists, skip (shouldn't happen if we check earlier)
+        if number in active_monitors[chat_id]:
+            return
+
+    future = executor.submit(monitor_number_loop, chat_id, number, provider_name, range_used, time.time())
+
+    # store the future for potential external cancellation (not used yet)
+    with monitors_lock:
+        if chat_id in active_monitors and number in active_monitors[chat_id]:
+            active_monitors[chat_id][number]['future'] = future
+
 # ---------- Core number handling ----------
 def handle_create_number(provider, chat_id, manual_range=None):
     try:
@@ -586,6 +661,14 @@ def handle_create_number(provider, chat_id, manual_range=None):
         if not allowed:
             tg_send(chat_id, f"⏳ Please wait {remaining}s.", main_keyboard(chat_id))
             return
+
+        # check max active monitors before creating a new number
+        with monitors_lock:
+            active_count = len(active_monitors.get(chat_id, {}))
+            if active_count >= MAX_ACTIVE_NUMBERS:
+                tg_send(chat_id, f"❌ Maximum {MAX_ACTIVE_NUMBERS} numbers already being monitored. Please wait.",
+                        main_keyboard(chat_id))
+                return
 
         bot = get_bot_instance(provider, user_id=chat_id)
 
@@ -600,36 +683,18 @@ def handle_create_number(provider, chat_id, manual_range=None):
             range_info = ''
 
         timeout_minutes = TIMEOUT_SECONDS // 60
+        # Check if number already being monitored
+        with monitors_lock:
+            if chat_id in active_monitors and number in active_monitors[chat_id]:
+                tg_send(chat_id, f"⏺ Number +{number} is already being monitored.", main_keyboard(chat_id))
+                return
+
         tg_send(chat_id,
-                f"{range_info}\n\n📞 <b>Your number:</b> <code>+{number}</code>\n\n⏳ <b>Waiting for message...</b>\n⏰ Timeout: {timeout_minutes} minutes",
+                f"{range_info}\n\n📞 <b>Your number:</b> <code>+{number}</code>\n\n🔄 <b>Monitoring started</b> – you will receive all messages within {timeout_minutes} mins.",
                 number_options_keyboard(number))
 
-        def wait_and_send():
-            try:
-                msg, otp = bot.wait_for_message(number, timeout=TIMEOUT_SECONDS)
-                if msg:
-                    tg_send(chat_id, format_inbox_message(number, provider, msg, otp), main_keyboard(chat_id))
-                    # Forward to ALL groups (multi‑group support)
-                    if GROUP_IDS:
-                        send_to_all_groups(format_group_message(number, provider, msg, otp), group_message_keyboard())
-                else:
-                    try:
-                        nums = bot.get_numbers_info(search=number)
-                        status = 'timeout'
-                        for n in nums:
-                            if clean_number(n.get('number', '')) == number:
-                                status = n.get('status', 'timeout')
-                                break
-                        if status == 'failed':
-                            tg_send(chat_id, format_failed_message(number, provider), main_keyboard(chat_id))
-                        else:
-                            tg_send(chat_id, format_timeout_message(number, provider), main_keyboard(chat_id))
-                    except Exception:
-                        tg_send(chat_id, format_timeout_message(number, provider), main_keyboard(chat_id))
-            except Exception:
-                tg_send(chat_id, f"❌ Error: An error occurred", main_keyboard(chat_id))
-
-        executor.submit(wait_and_send)
+        # start continuous monitoring
+        start_number_monitoring(chat_id, number, provider, manual_range if manual_range else 'Random')
 
     except Exception as e:
         tg_send(chat_id, f"❌ Error: {escape(str(e))}", main_keyboard(chat_id))
