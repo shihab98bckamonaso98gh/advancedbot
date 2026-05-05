@@ -471,18 +471,6 @@ def format_inbox_message(number, provider, full_message, otp):
     msg += f"\n💬 <b>Full Message:</b>\n<blockquote>{escape(full_message)}</blockquote>\n\n🕒 <b>Time:</b> {t}"
     return msg
 
-def format_timeout_message(number, provider):
-    t = datetime.now().strftime('%I:%M %p')
-    timeout_minutes = TIMEOUT_SECONDS // 60
-    return f"""⏰ <b>Timeout!</b>
-
-📞 <b>Number:</b> <code>+{number}</code>
-🏢 <b>Provider:</b> <code>{provider.upper()}</code>
-
-❌ No message received within {timeout_minutes} minutes.
-
-🕒 <b>Time:</b> {t}"""
-
 def format_failed_message(number, provider):
     t = datetime.now().strftime('%I:%M %p')
     return f"""❌ <b>Number Failed!</b>
@@ -555,26 +543,22 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
     cancel_evt = None
     try:
         bot = get_bot_instance(provider_name, user_id=chat_id)
-        # register in active_monitors
         with monitors_lock:
             if chat_id not in active_monitors:
                 active_monitors[chat_id] = {}
-            # prevent duplicate monitoring of the same number
             if number in active_monitors[chat_id]:
-                # already being monitored, nothing to do
                 return
             cancel_evt = threading.Event()
             active_monitors[chat_id][number] = {
-                'future': None,   # will be set later
+                'future': None,
                 'cancel': cancel_evt,
                 'provider': provider_name,
                 'start': start_time
             }
 
-        last_msg_text = ""   # track to avoid duplicate messages
+        last_msg_text = ""
         timeout = TIMEOUT_SECONDS
         failed = False
-        next_poll = 2
 
         while time.time() - start_time < timeout and not cancel_evt.is_set():
             try:
@@ -590,19 +574,14 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
                     if status == 'success' and msg and msg != last_msg_text:
                         last_msg_text = msg
                         otp = bot.extract_otp(msg)
-                        # send to user
                         tg_send(chat_id, format_inbox_message(number, provider_name, msg, otp), number_options_keyboard(number))
-                        # forward to all groups if OTP exists
                         if otp and GROUP_IDS:
                             send_to_all_groups(format_group_message(number, provider_name, msg, otp), group_message_keyboard())
-                    # else: no new message, continue polling
                 if failed:
                     break
-            except Exception as e:
-                # log error and continue polling (maybe temporary network issue)
+            except Exception:
                 pass
 
-            # adaptive sleep
             elapsed = time.time() - start_time
             if elapsed < 15:
                 sleep_time = 1.5
@@ -612,19 +591,16 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
                 sleep_time = 3
             else:
                 sleep_time = 4
-            # wait with cancellation check
             if cancel_evt.wait(sleep_time):
                 break
 
-        # after loop: send appropriate final message
+        # Only notify if the number explicitly failed (not on timeout)
         if failed:
             tg_send(chat_id, format_failed_message(number, provider_name))
-        # Timeout without receiving any message → do nothing (no longer disturb user)
-        # (previously sent format_timeout_message)
+
     except Exception as e:
         tg_send(chat_id, f"❌ Monitoring error for +{number}: {escape(str(e))}")
     finally:
-        # clean up monitoring entry
         with monitors_lock:
             if chat_id in active_monitors and number in active_monitors[chat_id]:
                 del active_monitors[chat_id][number]
@@ -632,24 +608,18 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
                     del active_monitors[chat_id]
 
 def start_number_monitoring(chat_id, number, provider_name, range_used):
-    """
-    Queue a new monitoring task, respecting max active numbers.
-    """
     with monitors_lock:
         if chat_id not in active_monitors:
             active_monitors[chat_id] = {}
-        # check global limit
         if len(active_monitors[chat_id]) >= MAX_ACTIVE_NUMBERS:
             tg_send(chat_id, f"❌ You already have {MAX_ACTIVE_NUMBERS} numbers being monitored. Wait for one to finish.",
                     main_keyboard(chat_id))
             return
-        # if number already exists, skip (shouldn't happen if we check earlier)
         if number in active_monitors[chat_id]:
             return
 
     future = executor.submit(monitor_number_loop, chat_id, number, provider_name, range_used, time.time())
 
-    # store the future for potential external cancellation (not used yet)
     with monitors_lock:
         if chat_id in active_monitors and number in active_monitors[chat_id]:
             active_monitors[chat_id][number]['future'] = future
@@ -662,7 +632,6 @@ def handle_create_number(provider, chat_id, manual_range=None):
             tg_send(chat_id, f"⏳ Please wait {remaining}s.", main_keyboard(chat_id))
             return
 
-        # check max active monitors before creating a new number
         with monitors_lock:
             active_count = len(active_monitors.get(chat_id, {}))
             if active_count >= MAX_ACTIVE_NUMBERS:
@@ -683,7 +652,6 @@ def handle_create_number(provider, chat_id, manual_range=None):
             range_info = ''
 
         timeout_minutes = TIMEOUT_SECONDS // 60
-        # Check if number already being monitored
         with monitors_lock:
             if chat_id in active_monitors and number in active_monitors[chat_id]:
                 tg_send(chat_id, f"⏺ Number +{number} is already being monitored.", main_keyboard(chat_id))
@@ -693,7 +661,6 @@ def handle_create_number(provider, chat_id, manual_range=None):
                 f"{range_info}\n\n📞 <b>Your number:</b> <code>+{number}</code>\n\n🔄 <b>Monitoring started</b> – you will receive all messages within {timeout_minutes} mins.",
                 number_options_keyboard(number))
 
-        # start continuous monitoring
         start_number_monitoring(chat_id, number, provider, manual_range if manual_range else 'Random')
 
     except Exception as e:
