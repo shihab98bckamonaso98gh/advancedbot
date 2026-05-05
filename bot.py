@@ -1,4 +1,4 @@
-# bot.py – Optimised Telegram SMS Bot (Multi‑Number, Continuous Monitoring)
+# bot.py – Optimised Telegram SMS Bot (Multi‑Number,Continuous Monitoring)
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
