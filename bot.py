@@ -1,4 +1,4 @@
-# bot.py – Optimised Telegram SMS Bot (Multi‑Number,Continuous Monitoring)
+# bot.py – Optimised Telegram SMS Bot (Multi‑Number, Continuous Monitoring + Balance & Withdraw)
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -24,6 +24,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_IDS     = [gid.strip() for gid in os.getenv('GROUP_ID', '').split(',') if gid.strip()]
 TIMEOUT_SECONDS = int(os.getenv('TIMEOUT_SECONDS', 600))
+ADMIN_IDS     = [int(x.strip()) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip()]
 
 DEFAULT_STEX_EMAIL    = os.getenv('STEX_EMAIL')
 DEFAULT_STEX_PASSWORD = os.getenv('STEX_PASSWORD')
@@ -57,6 +58,7 @@ def init_db():
         conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         conn.execute('PRAGMA journal_mode=WAL')
         c = conn.cursor()
+        # existing
         c.execute('''
             CREATE TABLE IF NOT EXISTS user_credentials (
                 user_id   INTEGER,
@@ -66,18 +68,177 @@ def init_db():
                 PRIMARY KEY (user_id, provider)
             )
         ''')
+        # new: user balance & wallets
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                balance_bdt REAL DEFAULT 0.0,
+                bkash TEXT,
+                rocket TEXT,
+                binance TEXT
+            )
+        ''')
+        # withdraw requests
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS withdraw_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount_bdt REAL,
+                method TEXT,
+                wallet_detail TEXT,
+                status TEXT DEFAULT 'pending',
+                request_time TEXT,
+                completed_time TEXT
+            )
+        ''')
         conn.commit()
         conn.close()
 init_db()
 
+# ---------- Wallet / Balance helpers (thread‑safe) ----------
+def ensure_user_exists(user_id):
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
+        conn.commit()
+        conn.close()
+
+def get_user_balance(user_id):
+    ensure_user_exists(user_id)
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        row = conn.execute('SELECT balance_bdt FROM users WHERE user_id = ?', (user_id,)).fetchone()
+        conn.close()
+        return row[0] if row else 0.0
+
+def credit_user(user_id, amount_bdt):
+    ensure_user_exists(user_id)
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute('UPDATE users SET balance_bdt = balance_bdt + ? WHERE user_id = ?', (amount_bdt, user_id))
+        conn.commit()
+        conn.close()
+
+def deduct_user(user_id, amount_bdt):
+    ensure_user_exists(user_id)
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute('UPDATE users SET balance_bdt = balance_bdt - ? WHERE user_id = ?', (amount_bdt, user_id))
+        conn.commit()
+        conn.close()
+
+def get_user_wallet(user_id):
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        row = conn.execute('SELECT bkash, rocket, binance FROM users WHERE user_id = ?', (user_id,)).fetchone()
+        conn.close()
+        if row:
+            return {'bkash': row[0], 'rocket': row[1], 'binance': row[2]}
+        return {'bkash': None, 'rocket': None, 'binance': None}
+
+def set_wallet_detail(user_id, field, value):
+    ensure_user_exists(user_id)
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute(f'UPDATE users SET {field} = ? WHERE user_id = ?', (value, user_id))
+        conn.commit()
+        conn.close()
+
+def create_withdrawal(user_id, amount, method, wallet_detail):
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        # check sufficient balance (balance - sum of pending requests)
+        pending_sum = conn.execute(
+            'SELECT COALESCE(SUM(amount_bdt), 0) FROM withdraw_requests WHERE user_id = ? AND status = "pending"',
+            (user_id,)
+        ).fetchone()[0]
+        balance = conn.execute('SELECT balance_bdt FROM users WHERE user_id = ?', (user_id,)).fetchone()[0]
+        if balance - pending_sum < amount:
+            conn.close()
+            return False, "Insufficient balance (after pending requests)."
+        conn.execute(
+            'INSERT INTO withdraw_requests (user_id, amount_bdt, method, wallet_detail, status, request_time) VALUES (?, ?, ?, ?, "pending", ?)',
+            (user_id, amount, method, wallet_detail, now)
+        )
+        conn.commit()
+        conn.close()
+        return True, None
+
+def get_pending_requests():
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        rows = conn.execute(
+            "SELECT id, user_id, amount_bdt, method, wallet_detail, request_time FROM withdraw_requests WHERE status='pending' ORDER BY request_time"
+        ).fetchall()
+        conn.close()
+        return [
+            {'id': r[0], 'user_id': r[1], 'amount_bdt': r[2], 'method': r[3], 'wallet_detail': r[4], 'time': r[5]}
+            for r in rows
+        ]
+
+def complete_withdrawal(request_id, admin_id):
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        row = conn.execute('SELECT id, user_id, amount_bdt, method, wallet_detail FROM withdraw_requests WHERE id=? AND status="pending"', (request_id,)).fetchone()
+        if not row:
+            conn.close()
+            return None
+        user_id = row[1]
+        amount = row[2]
+        method = row[3]
+        wallet = row[4]
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        conn.execute('UPDATE withdraw_requests SET status="completed", completed_time=? WHERE id=?', (now, request_id))
+        conn.execute('UPDATE users SET balance_bdt = balance_bdt - ? WHERE user_id = ?', (amount, user_id))
+        conn.commit()
+        conn.close()
+        # notify user
+        ex_rate = 125.0
+        if method in ('bkash', 'rocket'):
+            amount_display = f"{amount:.2f} BDT"
+        else:  # binance, mobile_recharge
+            amount_display = f"${amount/ex_rate:.4f}"
+        msg = (
+            f"🎉 <b>Withdrawal Approved</b>\n\n"
+            f"💵 <b>Amount:</b> {amount_display}\n"
+            f"🏦 <b>Method:</b> {method}\n"
+            f"📞 <b>Wallet:</b> {wallet}\n"
+            f"✅ <b>Status:</b> Complete\n\n"
+            f"We appreciate your trust! Share your experience or reach support below."
+        )
+        tg_send(user_id, msg)
+        return user_id
+
+def get_withdrawal_history(user_id=None):
+    """If user_id is None -> admin sees all completed, else user's completed."""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        if user_id is None:
+            rows = conn.execute(
+                "SELECT id, user_id, amount_bdt, method, wallet_detail, request_time, completed_time FROM withdraw_requests WHERE status='completed' ORDER BY completed_time DESC"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, user_id, amount_bdt, method, wallet_detail, request_time, completed_time FROM withdraw_requests WHERE user_id=? AND status='completed' ORDER BY completed_time DESC",
+                (user_id,)
+            ).fetchall()
+        conn.close()
+        return [
+            {'id': r[0], 'user_id': r[1], 'amount_bdt': r[2], 'method': r[3], 'wallet': r[4], 'request_time': r[5], 'completed_time': r[6]}
+            for r in rows
+        ]
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+# ---------- Credentials helpers (original) ----------
 def save_credentials(user_id, provider, email, password):
     with db_lock:
         conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         c = conn.cursor()
-        c.execute('''
-            INSERT OR REPLACE INTO user_credentials (user_id, provider, email, password)
-            VALUES (?, ?, ?, ?)
-        ''', (user_id, provider, email, password))
+        c.execute('INSERT OR REPLACE INTO user_credentials (user_id, provider, email, password) VALUES (?, ?, ?, ?)',
+                  (user_id, provider, email, password))
         conn.commit()
         conn.close()
 
@@ -85,8 +246,7 @@ def get_credentials(user_id, provider):
     with db_lock:
         conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         c = conn.cursor()
-        c.execute('SELECT email, password FROM user_credentials WHERE user_id=? AND provider=?',
-                  (user_id, provider))
+        c.execute('SELECT email, password FROM user_credentials WHERE user_id=? AND provider=?', (user_id, provider))
         row = c.fetchone()
         conn.close()
         return (row[0], row[1]) if row else (None, None)
@@ -102,7 +262,7 @@ def delete_credentials(user_id, provider=None):
         conn.commit()
         conn.close()
 
-# ---------- Thread‑safe globals ----------
+# ---------- Rate limit, states, globals ----------
 bot_instances    = {}
 instances_lock   = threading.RLock()
 user_states      = {}
@@ -110,17 +270,16 @@ states_lock      = threading.RLock()
 user_last_request = defaultdict(float)
 user_latest_range = {}
 user_latest_provider = {}
-RATE_LIMIT_SECONDS = 10
 
-# Multi-number monitoring
 MAX_ACTIVE_NUMBERS = 5
-active_monitors = {}      # chat_id -> { number: {'future':Future, 'cancel':Event, 'provider':str, 'start':float} }
+active_monitors = {}
 monitors_lock = threading.RLock()
-
 executor = ThreadPoolExecutor(max_workers=50)
 fake = Faker('en_US')
 
-# ---------- Improved OTP Pattern ----------
+RATE_LIMIT_SECONDS = 10
+EXCHANGE_RATE = 125.0
+
 OTP_PATTERN = re.compile(
     r'<#>\s*(\d[\d\s-]{2,7}\d)\b|'
     r'(?:code|otp|pin|verification)[:\s]+(\d[\d\s-]{2,7}\d)\b|'
@@ -142,7 +301,6 @@ def extract_otp_universal(text: str):
                     return code
     return None
 
-# ---------- TempMail ----------
 AVAILABLE_DOMAINS = [
     "mailto.plus","fexpost.com","fexbox.org","mailbox.in.ua",
     "rover.info","chitthi.in","fextemp.com","any.pink","merepost.com"
@@ -231,7 +389,7 @@ def fetch_mail_content(email, mail_id):
     except Exception:
         return ""
 
-# ---------- StexSMS Class (with speed optimisations) ----------
+# ---------- StexSMS Class ----------
 class StexSMS:
     def __init__(self, provider, email, password):
         self.provider = provider
@@ -402,7 +560,6 @@ def warmup_default_bots():
     except Exception as e:
         print(f"Warmup warning: {e}")
 
-# ---------- Rate limit ----------
 def check_rate_limit(chat_id):
     now = time.time()
     last = user_last_request[chat_id]
@@ -418,14 +575,23 @@ def validate_range(range_str):
 def main_keyboard(user_id):
     has_creds = any(get_credentials(user_id, p)[0] for p in ['stexsms', 'mnitnetwork'])
     login_text = '🔓 Logout' if has_creds else '🔐 Log IN'
-    return {
-        'keyboard': [
-            [{'text': '📞 Get Number'}, {'text': '🔄 Change Number'}],
-            [{'text': '👤 Fake Name'}, {'text': '🔐 Get 2FA'}],
-            [{'text': login_text}, {'text': '📧 Temp Mail'}]
-        ],
-        'resize_keyboard': True
-    }
+    keyboard = [
+        [{'text': '📞 Get Number'}, {'text': '🔄 Change Number'}],
+        [{'text': '👤 Fake Name'}, {'text': '🔐 Get 2FA'}],
+        [{'text': login_text}, {'text': '📧 Temp Mail'}],
+        [{'text': '👤 My Profile'}]
+    ]
+    return {'keyboard': keyboard, 'resize_keyboard': True}
+
+def profile_keyboard(user_id):
+    kb = [
+        [{'text': '💰 Balance'}],
+        [{'text': '📋 Withdraw History'}]
+    ]
+    if is_admin(user_id):
+        kb.insert(1, [{'text': '📋 Withdraw List'}])   # admin only
+    kb.append([{'text': '⬅️ Back'}])
+    return {'keyboard': kb, 'resize_keyboard': True}
 
 def gender_keyboard():
     return {'keyboard': [[{'text': '👨 Male'}, {'text': '👩 Female'}], [{'text': '⬅️ Back'}]], 'resize_keyboard': True}
@@ -462,7 +628,46 @@ def temp_domain_keyboard():
     rows.append([{'text': '⬅️ Cancel'}])
     return {'keyboard': rows, 'resize_keyboard': True}
 
+def wallet_method_keyboard():
+    return {
+        'inline_keyboard': [
+            [{'text': 'Bkash', 'callback_data': 'wallet_bkash'},
+             {'text': 'Rocket', 'callback_data': 'wallet_rocket'},
+             {'text': 'Binance', 'callback_data': 'wallet_binance'}]
+        ]
+    }
+
+def withdraw_method_keyboard():
+    return {
+        'inline_keyboard': [
+            [{'text': 'Bkash', 'callback_data': 'withdraw_method_bkash'},
+             {'text': 'Rocket', 'callback_data': 'withdraw_method_rocket'},
+             {'text': 'Binance', 'callback_data': 'withdraw_method_binance'},
+             {'text': 'Mobile Recharge', 'callback_data': 'withdraw_method_mobile'}]
+        ]
+    }
+
 # ---------- Message formatters ----------
+def format_balance_message(user_id):
+    balance = get_user_balance(user_id)
+    wallet = get_user_wallet(user_id)
+    usd = balance / EXCHANGE_RATE
+    text = (
+        "⚠️ <b>Double‑check your wallet! Wrong details = no refund.</b>\n\n"
+        f"🤑 <b>Balance:</b> {balance:.2f} BDT / ${usd:.4f}\n\n"
+        f"🌍 <b>Bkash:</b> {wallet['bkash'] or 'Not Set'}\n"
+        f"🌍 <b>Rocket:</b> {wallet['rocket'] or 'Not Set'}\n"
+        f"🌍 <b>Binance:</b> {wallet['binance'] or 'Not Set'}\n\n"
+        f"💳 <b>Minimum Withdrawal:</b> 20 BDT / $0.50"
+    )
+    inline_kb = {
+        'inline_keyboard': [
+            [{'text': 'Set wallet', 'callback_data': 'profile_set_wallet'},
+             {'text': 'Withdraw', 'callback_data': 'profile_withdraw'}]
+        ]
+    }
+    return text, inline_kb
+
 def format_inbox_message(number, provider, full_message, otp):
     t = datetime.now().strftime('%I:%M %p')
     msg = f"📩 <b>Message Received!</b>\n\n📞 <b>Number:</b> <code>+{number}</code>\n🏢 <b>Provider:</b> <code>{provider.upper()}</code>\n"
@@ -530,16 +735,11 @@ def tg_send(chat_id, text, keyboard=None, parse_mode='HTML'):
         pass
 
 def send_to_all_groups(text, keyboard=None):
-    """Send a message to every group ID in the .env list."""
     for gid in GROUP_IDS:
         tg_send(gid, text, keyboard)
 
-# ---------- Multi‑number background monitoring ----------
+# ---------- Multi‑number monitoring (balance‑aware) ----------
 def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
-    """
-    Background thread: continuously poll the number for new messages,
-    forward them to user and groups, and stop after timeout.
-    """
     cancel_evt = None
     try:
         bot = get_bot_instance(provider_name, user_id=chat_id)
@@ -559,6 +759,9 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
         last_msg_text = ""
         timeout = TIMEOUT_SECONDS
         failed = False
+        # Determine if user is using default account (no custom credentials)
+        custom_email, _ = get_credentials(chat_id, provider_name)
+        using_default = (custom_email is None)
 
         while time.time() - start_time < timeout and not cancel_evt.is_set():
             try:
@@ -577,24 +780,19 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
                         tg_send(chat_id, format_inbox_message(number, provider_name, msg, otp), number_options_keyboard(number))
                         if otp and GROUP_IDS:
                             send_to_all_groups(format_group_message(number, provider_name, msg, otp), group_message_keyboard())
+                        # Credit user if default account
+                        if using_default:
+                            credit_user(chat_id, 0.30)
                 if failed:
                     break
             except Exception:
                 pass
 
             elapsed = time.time() - start_time
-            if elapsed < 15:
-                sleep_time = 1.5
-            elif elapsed < 45:
-                sleep_time = 2
-            elif elapsed < 90:
-                sleep_time = 3
-            else:
-                sleep_time = 4
+            sleep_time = 1.5 if elapsed < 15 else (2 if elapsed < 45 else (3 if elapsed < 90 else 4))
             if cancel_evt.wait(sleep_time):
                 break
 
-        # Only notify if the number explicitly failed (not on timeout)
         if failed:
             tg_send(chat_id, format_failed_message(number, provider_name))
 
@@ -612,19 +810,16 @@ def start_number_monitoring(chat_id, number, provider_name, range_used):
         if chat_id not in active_monitors:
             active_monitors[chat_id] = {}
         if len(active_monitors[chat_id]) >= MAX_ACTIVE_NUMBERS:
-            tg_send(chat_id, f"❌ You already have {MAX_ACTIVE_NUMBERS} numbers being monitored. Wait for one to finish.",
-                    main_keyboard(chat_id))
+            tg_send(chat_id, f"❌ You already have {MAX_ACTIVE_NUMBERS} numbers being monitored.", main_keyboard(chat_id))
             return
         if number in active_monitors[chat_id]:
             return
 
     future = executor.submit(monitor_number_loop, chat_id, number, provider_name, range_used, time.time())
-
     with monitors_lock:
         if chat_id in active_monitors and number in active_monitors[chat_id]:
             active_monitors[chat_id][number]['future'] = future
 
-# ---------- Core number handling ----------
 def handle_create_number(provider, chat_id, manual_range=None):
     try:
         allowed, remaining = check_rate_limit(chat_id)
@@ -633,10 +828,8 @@ def handle_create_number(provider, chat_id, manual_range=None):
             return
 
         with monitors_lock:
-            active_count = len(active_monitors.get(chat_id, {}))
-            if active_count >= MAX_ACTIVE_NUMBERS:
-                tg_send(chat_id, f"❌ Maximum {MAX_ACTIVE_NUMBERS} numbers already being monitored. Please wait.",
-                        main_keyboard(chat_id))
+            if len(active_monitors.get(chat_id, {})) >= MAX_ACTIVE_NUMBERS:
+                tg_send(chat_id, f"❌ Max {MAX_ACTIVE_NUMBERS} numbers monitored.", main_keyboard(chat_id))
                 return
 
         bot = get_bot_instance(provider, user_id=chat_id)
@@ -652,21 +845,14 @@ def handle_create_number(provider, chat_id, manual_range=None):
             range_info = ''
 
         timeout_minutes = TIMEOUT_SECONDS // 60
-        with monitors_lock:
-            if chat_id in active_monitors and number in active_monitors[chat_id]:
-                tg_send(chat_id, f"⏺ Number +{number} is already being monitored.", main_keyboard(chat_id))
-                return
-
-        tg_send(chat_id,
-                f"{range_info}\n\n📞 <b>Your number:</b> <code>+{number}</code>\n\n🔄 <b>Monitoring started</b> – you will receive all messages within {timeout_minutes} mins.",
+        tg_send(chat_id, f"{range_info}\n\n📞 <b>Your number:</b> <code>+{number}</code>\n\n🔄 Monitoring started – all messages within {timeout_minutes} mins.",
                 number_options_keyboard(number))
-
         start_number_monitoring(chat_id, number, provider, manual_range if manual_range else 'Random')
 
     except Exception as e:
         tg_send(chat_id, f"❌ Error: {escape(str(e))}", main_keyboard(chat_id))
 
-# ---------- Login flow ----------
+# ---------- Login flow (unchanged) ----------
 def start_login(chat_id):
     with states_lock:
         user_states[chat_id] = {'step': 'awaiting_login_provider'}
@@ -681,9 +867,7 @@ def process_login_provider(chat_id, text):
     provider = 'stexsms' if 'Stex' in text else 'mnitnetwork'
     with states_lock:
         user_states[chat_id] = {'step': 'awaiting_login_email', 'provider': provider}
-    tg_send(chat_id,
-            f"📧 <b>Enter your email for {text}:</b>\n\n<i>Example: user@example.com</i>",
-            cancel_keyboard())
+    tg_send(chat_id, f"📧 <b>Enter your email for {text}:</b>\n\n<i>Example: user@example.com</i>", cancel_keyboard())
 
 def process_login_email(chat_id, text, state):
     if text == '⬅️ Cancel':
@@ -697,9 +881,7 @@ def process_login_email(chat_id, text, state):
         return
     state['email'] = email
     state['step'] = 'awaiting_login_password'
-    tg_send(chat_id,
-            "🔒 <b>Enter your password:</b>\n\n<i>Your password will be stored securely.</i>",
-            cancel_keyboard())
+    tg_send(chat_id, "🔒 <b>Enter your password:</b>\n\n<i>Your password will be stored securely.</i>", cancel_keyboard())
 
 def process_login_password(chat_id, text, state):
     if text == '⬅️ Cancel':
@@ -730,7 +912,7 @@ def handle_logout(chat_id):
     logout_user(chat_id)
     tg_send(chat_id, "🔓 <b>Logged out.</b> Using default accounts.", main_keyboard(chat_id))
 
-# ---------- TempMail background ----------
+# ---------- TempMail background (unchanged) ----------
 def temp_inbox_watcher():
     while True:
         with temp_email_lock:
@@ -788,7 +970,7 @@ def temp_cleanup():
 threading.Thread(target=temp_inbox_watcher, daemon=True).start()
 threading.Thread(target=temp_cleanup, daemon=True).start()
 
-# ---------- Telegram polling ----------
+# ---------- Telegram polling with expanded callback handling ----------
 def run_telegram_bot():
     warmup_default_bots()
     offset = 0
@@ -799,114 +981,224 @@ def run_telegram_bot():
                                     timeout=35)
             for update in response.json().get('result', []):
                 offset = update['update_id'] + 1
+
+                # ----- Callback queries (inline buttons) -----
+                if 'callback_query' in update:
+                    cq = update['callback_query']
+                    chat_id = cq['message']['chat']['id']
+                    data = cq['data']
+                    try:
+                        requests.post(f"{TG_API}/answerCallbackQuery",
+                                      data={'callback_query_id': cq['id'], 'text': 'OK'},
+                                      timeout=5)
+                    except Exception:
+                        pass
+
+                    if data == 'profile_set_wallet':
+                        tg_send(chat_id, "🔧 <b>Select wallet to set:</b>", wallet_method_keyboard())
+
+                    elif data.startswith('wallet_'):
+                        method = data.replace('wallet_', '')  # bkash, rocket, binance
+                        with states_lock:
+                            user_states[chat_id] = {'step': 'awaiting_wallet_detail', 'method': method}
+                        if method == 'binance':
+                            prompt = "🆔 <b>Enter your Binance UID:</b>"
+                        else:
+                            prompt = f"📱 <b>Enter your {method.capitalize()} number:</b>"
+                        tg_send(chat_id, prompt, cancel_keyboard())
+
+                    elif data == 'profile_withdraw':
+                        tg_send(chat_id, "💸 <b>Select withdrawal method:</b>", withdraw_method_keyboard())
+
+                    elif data.startswith('withdraw_method_'):
+                        method = data.replace('withdraw_method_', '')
+                        wallet = get_user_wallet(chat_id)
+                        if method in ('bkash', 'rocket', 'binance'):
+                            detail = wallet.get(method) or 'Not Set'
+                            if detail == 'Not Set':
+                                tg_send(chat_id, f"❌ Your {method} wallet is not set. Use 'Set wallet' first.", main_keyboard(chat_id))
+                                continue
+                        else:  # mobile recharge – use bkash
+                            detail = wallet.get('bkash') or 'Not Set'
+                            if detail == 'Not Set':
+                                tg_send(chat_id, "❌ Please set your Bkash number first (used for mobile recharge).", main_keyboard(chat_id))
+                                continue
+                        with states_lock:
+                            user_states[chat_id] = {
+                                'step': 'awaiting_withdraw_amount',
+                                'method': method,
+                                'wallet_detail': detail
+                            }
+                        balance = get_user_balance(chat_id)
+                        usd = balance / EXCHANGE_RATE
+                        msg = (
+                            f"💰 <b>Current Balance:</b> {balance:.2f} BDT / ${usd:.4f}\n"
+                            f"💳 <b>Minimum Withdrawal:</b> 20 BDT / $0.50\n\n"
+                            f"<b>Please enter the amount you want to withdraw (in BDT):</b>"
+                        )
+                        tg_send(chat_id, msg, cancel_keyboard())
+
+                    elif data.startswith('admin_complete_'):
+                        if not is_admin(chat_id):
+                            tg_send(chat_id, "Unauthorized.")
+                            continue
+                        req_id = int(data.split('_')[-1])
+                        completed_user = complete_withdrawal(req_id, chat_id)
+                        if completed_user:
+                            tg_send(chat_id, f"✅ Withdrawal request #{req_id} marked as completed and user notified.")
+                        else:
+                            tg_send(chat_id, "❌ Request not found or already processed.")
+                        pendings = get_pending_requests()
+                        if not pendings:
+                            tg_send(chat_id, "No pending withdrawal requests.")
+                        else:
+                            lines = []
+                            for p in pendings:
+                                lines.append(
+                                    f"🔹 <b>ID:</b> {p['id']} | <b>User:</b> {p['user_id']}\n"
+                                    f"   💵 {p['amount_bdt']} BDT via {p['method']} ({p['wallet_detail']})\n"
+                                    f"   🕒 {p['time']}"
+                                )
+                            kb = {
+                                'inline_keyboard': [
+                                    [{'text': f'✅ Complete #{p["id"]}', 'callback_data': f'admin_complete_{p["id"]}'}]
+                                    for p in pendings
+                                ]
+                            }
+                            tg_send(chat_id, "📋 <b>Pending Withdrawals:</b>\n\n" + "\n\n".join(lines), kb)
+
+                    else:
+                        if data == 'go_back':
+                            tg_send(chat_id, 'Main menu:', main_keyboard(chat_id))
+                        else:
+                            pass
+                    continue
+
+                # ----- Text messages -----
                 if 'message' in update:
                     text = update['message'].get('text', '').strip()
                     chat_id = update['message']['chat']['id']
+
                     with states_lock:
                         state = user_states.get(chat_id)
+
+                    # state machine for wallet detail input
+                    if state and state.get('step') == 'awaiting_wallet_detail':
+                        if text == '⬅️ Cancel':
+                            with states_lock:
+                                user_states.pop(chat_id, None)
+                            tg_send(chat_id, "Wallet setting cancelled.", main_keyboard(chat_id))
+                            continue
+                        method = state['method']
+                        if method in ('bkash', 'rocket'):
+                            if not re.fullmatch(r'\d{7,15}', text):
+                                tg_send(chat_id, "❌ Invalid phone number. Must be digits, 7‑15 characters.", cancel_keyboard())
+                                continue
+                        elif method == 'binance':
+                            if not re.fullmatch(r'\d{6,}', text):
+                                tg_send(chat_id, "❌ Invalid Binance UID. Must be numeric.", cancel_keyboard())
+                                continue
+                        set_wallet_detail(chat_id, method, text)
+                        with states_lock:
+                            user_states.pop(chat_id, None)
+                        bal_text, bal_kb = format_balance_message(chat_id)
+                        tg_send(chat_id, bal_text, bal_kb)
+                        continue
+
+                    # state for withdraw amount
+                    if state and state.get('step') == 'awaiting_withdraw_amount':
+                        if text == '⬅️ Cancel':
+                            with states_lock:
+                                user_states.pop(chat_id, None)
+                            tg_send(chat_id, "Withdrawal cancelled.", main_keyboard(chat_id))
+                            continue
+                        try:
+                            amount = float(text)
+                        except ValueError:
+                            tg_send(chat_id, "❌ Invalid amount. Enter a number.", cancel_keyboard())
+                            continue
+                        if amount < 20:
+                            tg_send(chat_id, "❌ Minimum withdrawal is 20 BDT.", cancel_keyboard())
+                            continue
+                        success, err = create_withdrawal(chat_id, amount, state['method'], state['wallet_detail'])
+                        with states_lock:
+                            user_states.pop(chat_id, None)
+                        if success:
+                            tg_send(chat_id, "✅ Your withdrawal request has been submitted and is processing. You will be notified upon completion.", main_keyboard(chat_id))
+                        else:
+                            tg_send(chat_id, f"❌ {err}", main_keyboard(chat_id))
+                        continue
+
+                    # Existing login flow
                     if state:
                         step = state.get('step')
                         if step == 'awaiting_login_provider':
-                            process_login_provider(chat_id, text)
-                            continue
+                            process_login_provider(chat_id, text); continue
                         elif step == 'awaiting_login_email':
-                            process_login_email(chat_id, text, state)
-                            continue
+                            process_login_email(chat_id, text, state); continue
                         elif step == 'awaiting_login_password':
-                            process_login_password(chat_id, text, state)
-                            continue
+                            process_login_password(chat_id, text, state); continue
                         elif step == 'awaiting_range':
                             if text == '⬅️ Back':
-                                with states_lock:
-                                    user_states.pop(chat_id, None)
-                                tg_send(chat_id, 'Select provider:', provider_keyboard())
-                                continue
+                                with states_lock: user_states.pop(chat_id, None)
+                                tg_send(chat_id, 'Select provider:', provider_keyboard()); continue
                             if not validate_range(text):
-                                tg_send(chat_id, '❌ Invalid range!\nMust contain <b>XXX</b> and only digits/X.\nExample: <code>2250163333XXX</code>')
-                                continue
+                                tg_send(chat_id, '❌ Invalid range! Must contain <b>XXX</b> and only digits/X.\nExample: <code>2250163333XXX</code>'); continue
                             prov = state['provider']
-                            with states_lock:
-                                user_states.pop(chat_id, None)
+                            with states_lock: user_states.pop(chat_id, None)
                             tg_send(chat_id, f"🔍 Getting number from: <code>{escape(text)}</code>...")
-                            handle_create_number(prov, chat_id, manual_range=text)
-                            continue
+                            handle_create_number(prov, chat_id, manual_range=text); continue
                         elif step == 'choose_range_mode':
                             prov = state['provider']
                             if text == '🎲 Random Range':
-                                with states_lock:
-                                    user_states.pop(chat_id, None)
-                                handle_create_number(prov, chat_id)
-                                continue
+                                with states_lock: user_states.pop(chat_id, None)
+                                handle_create_number(prov, chat_id); continue
                             elif text == '✏️ Manual Range':
-                                with states_lock:
-                                    user_states[chat_id] = {'step': 'awaiting_range', 'provider': prov}
+                                with states_lock: user_states[chat_id] = {'step': 'awaiting_range', 'provider': prov}
                                 prompt = '✏️ <b>Enter the range:</b>\n\n📝 Example: <code>2250163333XXX</code>\n📝 Example: <code>67077267XXX</code>\n\n⚠️ Must contain <b>XXX</b>'
-                                with states_lock:
-                                    latest = user_latest_range.get(chat_id)
-                                if latest:
-                                    prompt += f'\n\n📝 <b>Latest Range:</b> <code>{escape(latest)}</code>'
-                                tg_send(chat_id, prompt, {'keyboard': [[{'text': '⬅️ Back'}]], 'resize_keyboard': True})
-                                continue
+                                latest = user_latest_range.get(chat_id)
+                                if latest: prompt += f'\n\n📝 <b>Latest Range:</b> <code>{escape(latest)}</code>'
+                                tg_send(chat_id, prompt, {'keyboard': [[{'text': '⬅️ Back'}]], 'resize_keyboard': True}); continue
                             elif text == '⬅️ Back':
-                                with states_lock:
-                                    user_states.pop(chat_id, None)
-                                tg_send(chat_id, 'Select provider:', provider_keyboard())
-                                continue
+                                with states_lock: user_states.pop(chat_id, None)
+                                tg_send(chat_id, 'Select provider:', provider_keyboard()); continue
                         elif step == 'awaiting_gender':
                             if text == '⬅️ Back':
-                                with states_lock:
-                                    user_states.pop(chat_id, None)
-                                tg_send(chat_id, 'Welcome! Choose an option:', main_keyboard(chat_id))
-                                continue
+                                with states_lock: user_states.pop(chat_id, None)
+                                tg_send(chat_id, 'Welcome!', main_keyboard(chat_id)); continue
                             elif text in ['👨 Male', '👩 Female']:
                                 gender = 'male' if 'Male' in text else 'female'
-                                with states_lock:
-                                    user_states.pop(chat_id, None)
-                                tg_send(chat_id, format_identity_message(gender), main_keyboard(chat_id))
-                                continue
+                                with states_lock: user_states.pop(chat_id, None)
+                                tg_send(chat_id, format_identity_message(gender), main_keyboard(chat_id)); continue
                         elif step == 'awaiting_2fa_secret':
                             if text == '⬅️ Back':
-                                with states_lock:
-                                    user_states.pop(chat_id, None)
-                                tg_send(chat_id, 'Welcome! Choose an option:', main_keyboard(chat_id))
-                                continue
+                                with states_lock: user_states.pop(chat_id, None)
+                                tg_send(chat_id, 'Welcome!', main_keyboard(chat_id)); continue
                             else:
-                                with states_lock:
-                                    user_states.pop(chat_id, None)
+                                with states_lock: user_states.pop(chat_id, None)
                                 msg, success = format_2fa_code(text)
-                                tg_send(chat_id, msg, main_keyboard(chat_id))
-                                continue
+                                tg_send(chat_id, msg, main_keyboard(chat_id)); continue
                         elif step == 'awaiting_temp_domain':
                             if text == '⬅️ Cancel':
-                                with states_lock:
-                                    user_states.pop(chat_id, None)
-                                tg_send(chat_id, 'Cancelled.', main_keyboard(chat_id))
-                                continue
+                                with states_lock: user_states.pop(chat_id, None)
+                                tg_send(chat_id, 'Cancelled.', main_keyboard(chat_id)); continue
                             if text not in AVAILABLE_DOMAINS:
-                                tg_send(chat_id, 'Please select a domain from the list.', temp_domain_keyboard())
-                                continue
+                                tg_send(chat_id, 'Please select a domain.', temp_domain_keyboard()); continue
                             email = generate_temp_email(text)
                             with temp_email_lock:
                                 if chat_id not in user_temp_emails:
                                     user_temp_emails[chat_id] = {"emails": [], "last_active": time.time()}
-                                user_temp_emails[chat_id]["emails"].append({
-                                    "email": email,
-                                    "last_mail_id": None
-                                })
+                                user_temp_emails[chat_id]["emails"].append({"email": email, "last_mail_id": None})
                                 user_temp_emails[chat_id]["emails"] = user_temp_emails[chat_id]["emails"][-MAX_EMAILS:]
                                 user_temp_emails[chat_id]["last_active"] = time.time()
-                            with states_lock:
-                                user_states.pop(chat_id, None)
-                            tg_send(chat_id,
-                                    f"📧 <b>Your Temp Email</b>\n\n<code>{email}</code>\n\nInbox is monitored – new messages will appear here.",
-                                    main_keyboard(chat_id))
-                            continue
+                            with states_lock: user_states.pop(chat_id, None)
+                            tg_send(chat_id, f"📧 <b>Your Temp Email</b>\n\n<code>{email}</code>\n\nInbox is monitored.", main_keyboard(chat_id)); continue
 
+                    # ----- Main menu commands -----
                     if text.startswith('/start'):
                         parts = text.split()
                         payload = parts[1] if len(parts) > 1 else None
-                        with states_lock:
-                            user_states.pop(chat_id, None)
+                        with states_lock: user_states.pop(chat_id, None)
                         if payload == 'getnumber':
                             tg_send(chat_id, 'Select provider:', provider_keyboard())
                         else:
@@ -914,49 +1206,33 @@ def run_telegram_bot():
                         continue
 
                     if text == '⬅️ Back':
-                        with states_lock:
-                            user_states.pop(chat_id, None)
+                        with states_lock: user_states.pop(chat_id, None)
                         tg_send(chat_id, 'Welcome! Choose an option:', main_keyboard(chat_id))
+
                     elif text == '📞 Get Number':
                         tg_send(chat_id, 'Select provider:', provider_keyboard())
                     elif text == '🔄 Change Number':
-                        with states_lock:
-                            latest_range = user_latest_range.get(chat_id)
-                            latest_provider = user_latest_provider.get(chat_id)
+                        latest_range = user_latest_range.get(chat_id)
+                        latest_provider = user_latest_provider.get(chat_id)
                         if latest_range and latest_provider:
                             tg_send(chat_id, f"🔄 Fetching new number from range: <code>{escape(latest_range)}</code>...")
                             handle_create_number(latest_provider, chat_id, manual_range=latest_range)
                         else:
-                            tg_send(chat_id,
-                                    "❌ No manual range found.\nPlease use <b>📞 Get Number</b> with <b>✏️ Manual Range</b> first.",
-                                    main_keyboard(chat_id))
-                        continue
+                            tg_send(chat_id, "❌ No manual range found.\nUse <b>📞 Get Number</b> → <b>✏️ Manual Range</b> first.", main_keyboard(chat_id))
+
                     elif text == '🌐 StexSMS':
-                        with states_lock:
-                            user_states[chat_id] = {'step': 'choose_range_mode', 'provider': 'stexsms'}
+                        with states_lock: user_states[chat_id] = {'step': 'choose_range_mode', 'provider': 'stexsms'}
                         tg_send(chat_id, '🔧 <b>Choose range mode:</b>', range_mode_keyboard())
                     elif text == '🌐 MNIT Network':
-                        with states_lock:
-                            user_states[chat_id] = {'step': 'choose_range_mode', 'provider': 'mnitnetwork'}
+                        with states_lock: user_states[chat_id] = {'step': 'choose_range_mode', 'provider': 'mnitnetwork'}
                         tg_send(chat_id, '🔧 <b>Choose range mode:</b>', range_mode_keyboard())
                     elif text == '👤 Fake Name':
-                        with states_lock:
-                            user_states[chat_id] = {'step': 'awaiting_gender'}
+                        with states_lock: user_states[chat_id] = {'step': 'awaiting_gender'}
                         tg_send(chat_id, '👤 <b>Select Gender:</b>', gender_keyboard())
                     elif text == '🔐 Get 2FA':
-                        with states_lock:
-                            user_states[chat_id] = {'step': 'awaiting_2fa_secret'}
-                        instruction = """📲 <b>Paste your 2FA Secret Key</b>
-
-<code>ABCD EFGH IJKL MNOP QRS2 TUV7</code>
-<i>(Copy the format above)</i>
-
-📌 <b>Note:</b>
-• Only A-Z and 2-7
-• Spaces allowed or not
-
-<i>Example: JBSW Y3DP FH5Q VKBF H3TE 2SYW</i>"""
-                        tg_send(chat_id, instruction, {'keyboard': [[{'text': '⬅️ Back'}]], 'resize_keyboard': True})
+                        with states_lock: user_states[chat_id] = {'step': 'awaiting_2fa_secret'}
+                        tg_send(chat_id, "📲 <b>Paste your 2FA Secret Key</b>\n\n<code>ABCD EFGH IJKL MNOP QRS2 TUV7</code>\n<i>(Copy the format)</i>",
+                                {'keyboard': [[{'text': '⬅️ Back'}]], 'resize_keyboard': True})
                     elif text in ['🔐 Log IN', '🔓 Logout']:
                         has_creds = any(get_credentials(chat_id, p)[0] for p in ['stexsms', 'mnitnetwork'])
                         if has_creds:
@@ -964,21 +1240,51 @@ def run_telegram_bot():
                         else:
                             start_login(chat_id)
                     elif text == '📧 Temp Mail':
-                        with states_lock:
-                            user_states[chat_id] = {'step': 'awaiting_temp_domain'}
-                        tg_send(chat_id, '🌐 <b>Select a domain for your temporary email:</b>', temp_domain_keyboard())
+                        with states_lock: user_states[chat_id] = {'step': 'awaiting_temp_domain'}
+                        tg_send(chat_id, '🌐 <b>Select a domain:</b>', temp_domain_keyboard())
 
-                elif 'callback_query' in update:
-                    cq = update['callback_query']
-                    cq_chat = cq['message']['chat']['id']
-                    if cq['data'] == 'go_back':
-                        tg_send(cq_chat, 'Main menu:', main_keyboard(cq_chat))
-                    try:
-                        requests.post(f"{TG_API}/answerCallbackQuery",
-                                      data={'callback_query_id': cq['id'], 'text': 'OK'},
-                                      timeout=5)
-                    except Exception:
-                        pass
+                    # ----- NEW: My Profile menu -----
+                    elif text == '👤 My Profile':
+                        with states_lock: user_states.pop(chat_id, None)
+                        tg_send(chat_id, "👤 <b>Profile Menu</b>", profile_keyboard(chat_id))
+                    elif text == '💰 Balance':
+                        bal_text, bal_kb = format_balance_message(chat_id)
+                        tg_send(chat_id, bal_text, bal_kb)
+                    elif text == '📋 Withdraw History':
+                        history = get_withdrawal_history(chat_id)
+                        if not history:
+                            tg_send(chat_id, "📭 No completed withdrawals yet.")
+                        else:
+                            lines = []
+                            for h in history:
+                                lines.append(
+                                    f"🔹 <b>ID:</b> {h['id']} | <b>Method:</b> {h['method']}\n"
+                                    f"   💵 {h['amount_bdt']} BDT | 🕒 {h['completed_time']}"
+                                )
+                            tg_send(chat_id, "📋 <b>Your Withdrawal History:</b>\n\n" + "\n\n".join(lines))
+                    elif text == '📋 Withdraw List':
+                        if not is_admin(chat_id):
+                            tg_send(chat_id, "❌ Unauthorized.")
+                            continue
+                        pendings = get_pending_requests()
+                        if not pendings:
+                            tg_send(chat_id, "No pending withdrawal requests.")
+                        else:
+                            lines = []
+                            kb_buttons = []
+                            for p in pendings:
+                                lines.append(
+                                    f"🔹 <b>ID:</b> {p['id']} | <b>User:</b> {p['user_id']}\n"
+                                    f"   💵 {p['amount_bdt']} BDT via {p['method']} ({p['wallet_detail']})\n"
+                                    f"   🕒 {p['time']}"
+                                )
+                                kb_buttons.append([{'text': f'✅ Complete #{p["id"]}', 'callback_data': f'admin_complete_{p["id"]}'}])
+                            kb = {'inline_keyboard': kb_buttons}
+                            tg_send(chat_id, "📋 <b>Pending Withdrawals:</b>\n\n" + "\n\n".join(lines), kb)
+
+                    # unknown text → main menu fallback
+                    else:
+                        tg_send(chat_id, "I didn't understand that. Use the menu buttons.", main_keyboard(chat_id))
 
         except requests.exceptions.Timeout:
             continue
